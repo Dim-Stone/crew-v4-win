@@ -1,0 +1,28 @@
+# CREW V4 — desktop dependencies
+# Python 3.13 (Windows x64)
+#
+# Install:
+#   python -m venv .venv_qt
+#   .venv_qt\Scripts\python.exe -m pip install -r requirements-desktop.txt -c constraints.txt
+#
+# Version ranges only; exact pins live in constraints.txt.
+
+# --- window shell ---
+pywebview>=5.0
+
+# --- web / persistence ---
+Flask>=3.1
+Flask-SQLAlchemy>=3.1
+SQLAlchemy>=2.0
+python-dotenv>=1.0
+
+# --- LLM orchestration ---
+crewai>=1.9
+
+# --- document parsing (optional at runtime; needed for material mode) ---
+PyMuPDF>=1.26,<2.0
+python-pptx>=1.0,<2.0
+python-docx>=1.2,<2.0
+
+# --- tests ---
+pytest>=8.0,<10.0

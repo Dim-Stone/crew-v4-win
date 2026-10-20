@@ -1,0 +1,5 @@
+{
+  "//": "仅用于让 Node 把本目录下的 .js 按 ES Module 解析（供 tests/js 下的测试脚本 import）。浏览器不会读取此文件。",
+  "type": "module",
+  "private": true
+}

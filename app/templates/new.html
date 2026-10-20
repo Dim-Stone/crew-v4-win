@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}新建课程 · CREW{% endblock %}
+
+{% block body %}
+<main class="page">
+  <div class="section-head">
+    <h1>新建课程</h1>
+    <a href="/" class="faint">返回课程列表</a>
+  </div>
+
+  <!-- 步骤指示器：五步都在这一页里，所以它只需要回答"现在在哪一步"。
+       用一条 2px 的线表示（走过的深线、当前的强调色），与整站"用线表达层次"
+       一致，不引入进度环之类的新语言。 -->
+  <ol class="steps" id="steps">
+    <li data-step="direction"><span class="num">1</span>学习方向</li>
+    <li data-step="source"><span class="num">2</span>内容来源</li>
+    <li data-step="intake"><span class="num">3</span>摸底</li>
+    <li data-step="profile"><span class="num">4</span>画像</li>
+    <li data-step="outline"><span class="num">5</span>大纲</li>
+  </ol>
+
+  <div class="intake-layout">
+    <div class="intake-main">
+
+      <!-- 1 方向 -->
+      <div id="step-direction" class="section">
+        <div class="field">
+          <label for="direction">学习方向 / 学科</label>
+          <input id="direction" type="text" placeholder="例如：环境工程导论、线性代数">
+        </div>
+        <div class="field">
+          <label for="focus">这次想重点解决什么（可留空）</label>
+          <textarea id="focus" rows="2" placeholder="例如：只想搞懂 BOD 和 COD 的区别；下周有考试"></textarea>
+        </div>
+        <div class="row-end">
+          <button id="to-source" class="primary">下一步：内容从哪里来</button>
+        </div>
+      </div>
+
+      <!-- 2 内容来源：这一步决定后面按什么组织内容，所以单独成步、必须显式选 -->
+      <div id="step-source" class="section hidden">
+        <h2>内容从哪里来</h2>
+        <p class="lead">这一步决定后面按什么组织内容。三种选法差别不小，按你的情况挑一种。</p>
+
+        <div class="choices">
+          <label class="choice">
+            <input type="radio" name="material_mode" value="">
+            <span class="choice-body">
+              <strong>没有资料，请你直接安排</strong>
+              <span class="choice-note">我按这门学科通常的学习路径来组织（和现在一样）。</span>
+            </span>
+          </label>
+
+          <label class="choice">
+            <input type="radio" name="material_mode" value="strict">
+            <span class="choice-body">
+              <strong>我有资料，请严格按资料讲</strong>
+              <span class="choice-note">资料的内容和顺序就是课程的内容和顺序；我不会补充资料里没有的东西。</span>
+              <span class="choice-warn">选这个的话，请先把文件名整理成「顺序数字-章节名称」（如 01-矩阵的定义.pdf）——这份顺序就是讲课顺序。</span>
+            </span>
+          </label>
+
+          <label class="choice">
+            <input type="radio" name="material_mode" value="reference">
+            <span class="choice-body">
+              <strong>我有资料，但只作参考</strong>
+              <span class="choice-note">以资料为主要依据；资料没覆盖的地方我来补上，并标明哪些是我补的。</span>
+            </span>
+          </label>
+        </div>
+
+        <!-- 选了"有资料"才展开 -->
+        <div id="material-picker" class="hidden">
+          <div class="field">
+            <label for="material-path">资料文件夹</label>
+            <input id="material-path" type="text" placeholder="例如：D:\课件\高等数学">
+            <div class="hint">
+              填本机文件夹路径即可，不用上传——直接读，也快。支持 PDF、PPTX、DOCX、TXT、MD。
+            </div>
+            <div class="hint">
+              <strong>建议这样命名</strong>：<code>顺序数字-章节名称</code>，
+              例如 <code>01-矩阵的定义.pdf</code>、<code>02-行列与阶数.pptx</code>。
+              文件名是我判断顺序的<strong>主要依据</strong>——名字乱了，章节顺序就可能不对。
+            </div>
+          </div>
+          <div class="row-end">
+            <button id="preview-materials" class="ghost">先看看能读到什么</button>
+          </div>
+          <div id="material-preview"></div>
+          <div class="notice notice-info">
+            资料有几十份、或者文件顺序是乱的时，我需要先读一遍再排章节，
+            <strong>可能要几分钟</strong>。你可以离开这个页面去做别的事，回来时结果还在。
+          </div>
+        </div>
+
+        <div class="row-end">
+          <button id="to-intake" class="primary">下一步：了解我的情况</button>
+        </div>
+      </div>
+
+      <!-- 3 摸底 -->
+      <div id="step-intake" class="section hidden">
+        <h2>先了解一下你</h2>
+        <p class="lead">这几项会决定之后怎么给你讲。</p>
+        <form id="intake-form"></form>
+        <div class="row-end">
+          <button id="submit-intake" class="primary">提交</button>
+        </div>
+      </div>
+
+      <!-- 4 画像 -->
+      <div id="step-profile" class="section hidden">
+        <h2>系统对你的理解</h2>
+        <div id="profile-box"></div>
+        <div class="row-end">
+          <button id="generate-outline" class="primary">生成学习大纲</button>
+        </div>
+      </div>
+
+      <!-- 5 大纲 -->
+      <div id="step-outline" class="section hidden">
+        <h2>学习大纲</h2>
+        <div id="outline-box"></div>
+        <div class="row-end">
+          <button id="start-course" class="primary hidden">进入课程</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右栏看板：**这门课现在长什么样**——方向、内容来源、摸底答了几项、
+         画像、大纲规模。填进去的东西立刻出现在这里，不必来回翻步骤确认；
+         没填的项如实说"还没填"，不预填、不猜测。
+         这块是"共创"里唯一不需要模型的部分：它只是把已经定下来的事摆在旁边。 -->
+    <aside class="intake-aside" aria-label="课程设置">
+      <h2 class="aside-title">这门课现在长什么样</h2>
+      <p class="aside-hint">这一步填的内容会立刻出现在下面。</p>
+      <div class="aside-rows" id="aside-rows"></div>
+      <p class="adaptation" id="aside-adaptation"></p>
+    </aside>
+  </div>
+</main>
+{% endblock %}

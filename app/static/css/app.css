@@ -1,0 +1,2618 @@
+/* ============================================================================
+   CREW · 设计基座（多智能体学习工作台）
+   ----------------------------------------------------------------------------
+   这一版基座按使用者给的设计稿重做（2026-09）：**7 位智能体各有身份色**，
+   深浅两套主题自适应，层次用「卡片 + 柔和阴影 + 1px 线」表达。
+   此前的 Swiss 锚点（白底 / 只有一个强调色 / 只用细线、不许阴影与渐变）是使用者
+   明确要求替换掉的，所以 `tests/test_design_tokens.py` 的守卫也一并改成守这一版
+   （见那个文件开头的说明）——**守卫本身不删，换的是它守什么**。
+
+   三条硬约束（改样式别越界）：
+     ① 智能体身份色只出现在"表示某个智能体"的地方（协作轨 / 消息卡 / 徽章），
+        不做普通装饰色；7 个色号一律从 --agent-* 取，不许写死；
+     ② 层次用卡片 + 阴影，阴影只取 --shadow-sm/md/lg 三档；
+     ③ 圆角只取 --radius-sm/md/lg/full 四档，不再出现字面像素。
+
+   主题：默认跟随系统（见 base.html 里那段尽早执行的内联脚本），
+   顶栏可手动切换并把选择记在 localStorage。两套色都定义在下面。
+   ========================================================================== */
+
+:root {
+  /* ---- 表面（默认：暗色 Deep Focus）---- */
+  --bg-app: #0d1117;
+  --bg-surface: #161b22;
+  --bg-surface-elevated: #21262d;
+  --bg-glass: rgba(22, 27, 34, 0.78);
+  --border-subtle: rgba(240, 246, 252, 0.10);
+  --border-strong: rgba(240, 246, 252, 0.22);
+  --border-focus: #818cf8;
+
+  /* ---- 文字 ---- */
+  --text-primary: #f0f6fc;
+  --text-secondary: #8b949e;
+  --text-muted: #6e7681;
+
+  /* ---- 强调色（品牌）：按钮、焦点、链接 ---- */
+  --accent: #6366f1;
+  --accent-strong: #4f46e5;
+  --accent-on: #ffffff;
+  --accent-soft: rgba(99, 102, 241, 0.16);
+  /* 主按钮与"忙碌中"的辉光：随主题换深浅，别在两处各写一个 rgba */
+  --accent-glow: rgba(99, 102, 241, 0.38);
+
+  /* ---- 7 位智能体的身份色（设计稿的角色色谱）---- */
+  --agent-interviewer: #06b6d4;      /* 学情访谈员 · 湖青 */
+  --agent-planner: #a855f7;          /* 课程架构师 · 极光紫 */
+  --agent-lesson-planner: #6366f1;   /* 课时教案师 · 靛蓝 */
+  --agent-lecturer: #f59e0b;         /* 主讲导师 · 琥珀 */
+  --agent-visual: #10b981;           /* 板书图解师 · 祖母绿 */
+  --agent-observer: #f43f5e;         /* 学情观察员 · 玫瑰 */
+  --agent-material: #0ea5e9;         /* 资料学者 · 天青 */
+
+  /* ---- 语义色 ---- */
+  --ok: #10b981;
+  --warn: #d29922;
+  --err: #f85149;
+
+  /* ---- 圆角与阴影 ---- */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-full: 9999px;
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, .30);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, .40);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, .48);
+  /* 全屏看图时的遮罩：两套主题各一份，所以单独一个 token */
+  --overlay: rgba(0, 0, 0, .70);
+
+  /* ---- 外壳几何 ----
+     顶栏是"窗口顶栏"（品牌 + 环境状态 + 主题），高度刻意做窄：
+     导航已经挪到左栏，顶栏只剩状态信息，占 56px 就太浪费了。
+     这两个值在 `course.html` 的 `calc(100vh - var(--topbar-h))` 里被用到，
+     所以改动它们**整个外框会跟着走**，不需要去别处找硬编码的高度。 */
+  --topbar-h: 48px;
+  --rail-w: 216px;
+  --rail-w-collapsed: 62px;
+  /* 左栏当前的实际宽度：折叠时改成窄的那个值。 */
+  --rail-current: var(--rail-w);
+
+  /* ---- 阅读相关：来自界面偏好（设置 → 界面），由 js/prefs.js 覆盖 ----
+     这里写的是**默认值**，必须与 `app/preferences.py` 的 DEFAULTS 一致。
+     不一致的话，"没设置过"和"恢复默认"会画出两个样子——而用户没法解释
+     为什么。有一条测试盯着这两边的一致性（tests/test_preferences.py）。 */
+  --reading-font: 15px;      /* 正文与讲义的字号 */
+  --reading-line: 1.75;      /* 行高，无单位 */
+  --page-max: 920px;         /* 页面内容的最大宽度（工作台、新建、设置） */
+  --chat-max: 920px;         /* 对话列的最大宽度，与上面一致：都是"读起来舒服的宽度" */
+  /* 密度：紧凑模式下把区块之间的间距压掉一点。
+     用乘法而不是给每个间距写两套值——那样改一处漏一处。 */
+  --density: 1;
+
+  /* ---- 旧变量名 → 新 token 的别名 ----
+     其余几百行规则一直用这些名字（--surface / --line / --radius …），
+     留一层别名，换基座就只发生在这一处，不必逐行改。 */
+  --page: var(--bg-app);
+  --surface: var(--bg-surface);
+  --sunken: var(--bg-surface-elevated);
+  --hover: var(--bg-surface-elevated);
+  --text: var(--text-primary);
+  --text-soft: var(--text-secondary);
+  --text-faint: var(--text-muted);
+  --line: var(--border-subtle);
+  --line-strong: var(--border-strong);
+  --radius: var(--radius-sm);
+  --radius-card: var(--radius-lg);
+}
+
+/* 明色主题（Editorial Clean）：白天阅读与公式推演用。
+   只覆盖颜色——圆角、阴影、间距两套共用，免得两套主题慢慢长歪。 */
+:root[data-theme="light"] {
+  --bg-app: #f6f7fb;
+  --bg-surface: #ffffff;
+  --bg-surface-elevated: #f1f5f9;
+  --bg-glass: rgba(255, 255, 255, 0.82);
+  --border-subtle: rgba(15, 23, 42, 0.10);
+  --border-strong: rgba(15, 23, 42, 0.20);
+  --border-focus: #4f46e5;
+
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+
+  --accent: #4f46e5;
+  --accent-strong: #4338ca;
+  --accent-soft: rgba(79, 70, 229, 0.10);
+  --accent-glow: rgba(79, 70, 229, 0.22);
+
+  /* 身份色在浅底上要压深一档，否则细字与细线会糊 */
+  --agent-interviewer: #0891b2;
+  --agent-planner: #9333ea;
+  --agent-lesson-planner: #4f46e5;
+  --agent-lecturer: #d97706;
+  --agent-visual: #059669;
+  --agent-observer: #e11d48;
+  --agent-material: #0284c7;
+
+  --ok: #15803d;
+  --warn: #b45309;
+  --err: #b91c1c;
+
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, .06), 0 1px 3px rgba(15, 23, 42, .04);
+  --shadow-md: 0 4px 14px rgba(15, 23, 42, .08);
+  --shadow-lg: 0 12px 32px rgba(15, 23, 42, .12);
+  --overlay: rgba(15, 23, 42, .55);
+}
+
+* { box-sizing: border-box; }
+
+/* 细致、优雅的轻量原生滚动条 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-full);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  /* Inter 若本机装了就用它；没有就退到系统无衬线——**不引外链字体**，
+     这个项目离线也要能跑（vendor 里的 KaTeX / mermaid 是同一套思路）。 */
+  font-family: Inter, "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  /* 正文的字号与行高来自界面偏好（设置 → 界面）。默认值与设计稿一致，
+     所以"没设置过"和"加偏好之前"画出来是同一个样子。
+     取值由 `js/prefs.js` 写到 <html> 的 style 上（服务端不参与渲染）。 */
+  font-size: var(--reading-font);
+  /* 讲义是长段落，行高给足 */
+  line-height: var(--reading-line);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* 动效开关：`data-motion="off"` 时下面那条规则会把动画压掉。
+     用属性而不是类，是因为属性上能看出"为什么"（看 HTML 就知道是被关掉的）。 */
+  --motion: 1;
+}
+
+html[data-motion="off"] { --motion: 0; }
+
+/* 代码与公式用等宽，且优先用本机装了的那些编程字体 */
+.mono, code, pre, .rail-file-path, .fact-value code {
+  font-family: "Fira Code", "JetBrains Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
+}
+
+
+/* 数字一律等宽，日期/天数/序号才会对齐 */
+.num, time, .count, .stat-value { font-variant-numeric: tabular-nums; }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+h1 { font-size: 22px; font-weight: 600; line-height: 1.3; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 17px; font-weight: 600; line-height: 1.3; margin: 0 0 12px; }
+h3 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+p  { margin: 0 0 12px; }
+
+.lead { color: var(--text-soft); margin: 0 0 24px; }
+.muted { color: var(--text-soft); }
+.faint { color: var(--text-faint); font-size: 13px; }
+.hidden { display: none !important; }
+
+/* ---------------------------------------------------------------- 顶栏 */
+/* 玻璃质感（设计稿里的 Floating Capsule 一脉）：内容从下面滚过去时，
+   品牌与导航仍然看得清，又不至于糊成一块实心色。 */
+.topbar {
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 28px;
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border-subtle);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.topbar .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+/* 品牌标记：一个渐变圆点，颜色取强调色与"课程架构师"的身份色 */
+.topbar .brand::before {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: var(--radius-full);
+  background: linear-gradient(135deg, var(--accent), var(--agent-planner));
+}
+/* 品牌名做成渐变文字（设计稿的 heading-gradient 做法）：
+   明暗两套各从亮到暗，颜色全部来自 token，不写死。 */
+.topbar .brand .brand-name {
+  background: linear-gradient(135deg, var(--text-primary), var(--text-muted));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: var(--text-primary);
+}
+.topbar .brand .brand-sub { color: var(--text-muted); font-weight: 400; }
+
+/* ---------------------------------------------------------------- 左侧导航 */
+/* 这是"客户端"的形状：左边一列固定的目的地，右边是内容。
+   以前导航挤在顶栏里（课程 / 新建课程 / 设置），那是网页的形状——
+   目的地一多就放不下，而且每加一个页面都要重新考虑顶栏怎么排。 */
+.shell {
+  display: grid;
+  grid-template-columns: var(--rail-current) minmax(0, 1fr);
+  /* 左栏自己滚（内容长了不影响外框），正文区自己滚（见各页面） */
+  align-items: stretch;
+  min-height: calc(100vh - var(--topbar-h));
+  min-height: calc(100dvh - var(--topbar-h));
+}
+/* 折叠：只留图标。宽度只用改一个变量——`--rail-current` 是所有地方的唯一来源。 */
+/* 折叠状态的**唯一载体是 `<html data-rail>`**（由 `base.html` 的首屏脚本 +
+   `theme.js` 维护）。这一行原先写的是 `.shell[data-rail="collapsed"]`——那是
+   **第二个载体**，而首屏脚本只设 `<html>`，于是折叠要等到 `theme.js`
+   （module，延迟执行）跑起来才生效：页面先按"展开"画一遍，再跳成折叠。
+   点导航会整页加载，所以每点一次都跳一下——就是那个"抽搐"。
+   换成只认 `<html>` 之后，首屏一次画对，没有跳动。 */
+html[data-rail="collapsed"] .shell { --rail-current: var(--rail-w-collapsed); }
+
+.rail-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 10px;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  /* 跟着网格行一起拉伸到内容高度：内层用 `position: sticky` 让它**停在视口里**。
+     直接对它自己用 sticky 是不行的——它和正文同处一个网格行，
+     没有可"粘"的滚动容器；所以拉伸 + 内层 sticky 才是对的做法。 */
+  align-self: stretch;
+}
+
+/* 左栏自己粘在视口上，内部滚动。
+   这样正文滚到很下面时，导航还在原地——否则用户读完一门课的讲义
+   要一路滚回顶部才能换页面。 */
+.rail-sticky {
+  position: sticky;
+  top: var(--topbar-h);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: calc(100vh - var(--topbar-h) - 16px);
+  max-height: calc(100dvh - var(--topbar-h) - 16px);
+  overflow-y: auto;
+}
+
+.rail-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 11px;
+  border-radius: var(--radius-md);
+  color: var(--text-soft);
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: color .15s, background-color .15s;
+}
+.rail-item:hover { color: var(--text-primary); background: var(--bg-surface-elevated); text-decoration: none; }
+.rail-item[aria-current="page"] {
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+.rail-item svg {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* 图标右上方那枚小徽标（保留给"新建课程正在进行中"这类状态用） */
+.rail-dot {
+  margin-left: auto;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+
+/* 折叠状态下文字消失，只留图标。
+   用 `display: none` 而不是 `opacity: 0`：后者会让文字仍然占位，
+   而"折叠"的全部意义就是把宽度让出来。
+   同时给一个 `title`（见 base.html），否则只剩图标时认不出是哪个目的地。 */
+html[data-rail="collapsed"] .rail-item .label,
+html[data-rail="collapsed"] .rail-dot { display: none; }
+html[data-rail="collapsed"] .rail-item { justify-content: center; padding: 9px 0; }
+
+/* ---- 课程页是"一屏之内"的布局，其余页面是"整页滚动" ----
+   这一个区别由 `body[data-page]` 决定，前端不需要额外做任何事
+   （`base.html` 上一个属性就够了）。
+
+   为什么必须分开：课程页的 `.workbench` 把自己的高度定成
+   `calc(100vh - 顶栏)`，内部三栏各自滚动。而 `.shell-body` 在普通页面上
+   必须能长高（否则工作台的课程列表滚不动），在课程页上又必须**不许长高**
+   （否则套着 100vh 的布局会溢出一点，页面出现一条没用的滚动条）。 */
+body[data-page="course"] .shell {
+  height: calc(100vh - var(--topbar-h));
+  height: calc(100dvh - var(--topbar-h));
+  min-height: 0;
+  overflow: hidden;
+}
+.shell-body { min-width: 0; }
+body[data-page="course"] .shell-body { min-height: 0; overflow: hidden; }
+/* 顶栏右侧那一组：环境状态 + 主题开关。
+   导航已经挪到左栏（见 `.rail-nav`），所以这里只剩"当前状态"和"一个开关"。 */
+.topbar-status { display: flex; align-items: center; gap: 10px; }
+
+#env {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all .2s ease;
+  user-select: none;
+}
+/* 状态点：绿=配置好了，黄=还缺密钥。用点而不是只靠文字，
+   是因为扫一眼就能看出"现在能不能用"，不用读那句话。 */
+#env::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--ok);
+  flex-shrink: 0;
+}
+#env.badge-warn::before {
+  background: var(--warn);
+}
+
+/* 左栏折叠开关。与主题开关**同一形状、同一大小**，因为它们并列在同一行上，
+   而且都是"改外观"的动作——不一样的形状会让人以为是两类东西。
+
+   为什么它在顶栏而不是左栏底部：第一版放在左栏最下面，实际用起来
+   "折叠之后很难再点到"（它自己就在那个变窄的区域里）。顶栏固定不动，
+   放这里永远点得到。 */
+/* ------------------------------------------------- 左栏顶部的折叠开关
+   它自己也是一个 `.rail-item`（见 `base.html`）：同一列、同一个图标尺寸、
+   同一种悬停手感。看起来就是"这一列的一部分"，而不是从顶栏塞过来的一个圆钮。
+
+   为什么放在左栏**最上面**：它管的就是这一列，手和眼睛本来就在这一列上；
+   而且放在最上面还有一条硬理由——**折叠之后它自己仍然点得到**。
+
+   **类名为什么是 `.nav-toggle` 而不是 `.rail-toggle`**：本文件后面还有一个
+   `.rail-toggle`，那是**课程页进度尺**那个按钮（`course.html` 的
+   `#progress-toggle`，`position: absolute; left: -40px`）。给这个导航开关起同一个
+   类名时，它就被那条规则按到了 `position: absolute` 上——按钮整个跑到左栏外面，
+   而肉眼看只像"位置有点怪"，很难联想到是类名撞了。用 CDP 量出
+   `position: absolute / left: -30` 才定下案来。 */
+button.rail-item {
+  width: 100%;
+  background: none;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+  /* 只补这一项：`<button>` 默认用系统 UI 字体，不继承页面字体 */
+  font-family: inherit;
+}
+/* 箭头方向跟着状态走：展开时指向"关进去"，折叠时指向"拉出来"。
+   两个 `<path>` 都在 HTML 里，靠 CSS 二选一——比在 JS 里换 innerHTML 简单，
+   也不会在首屏那一瞬间闪出错的箭头。
+   选择器挂在 `<html>` 上，与宽度那条规则同一个来源（见 `.shell` 上面那段说明）。 */
+.nav-toggle .i-expand { display: none; }
+html[data-rail="collapsed"] .nav-toggle .i-collapse { display: none; }
+html[data-rail="collapsed"] .nav-toggle .i-expand { display: inline; }
+
+/* 窄屏（<900px）左栏是**强制**折叠的（见文件末尾的媒体查询），
+   所以这个开关点了不会有反应。点了没反应的控件比没有更糟，直接藏掉。 */
+@media (max-width: 900px) {
+  .nav-toggle { display: none; }
+}
+
+/* 深浅主题开关：细线圆钮，图标用 svg（不用 unicode 字符当图标——
+   字形随字体变，位置也压不准）。当前是哪个主题就显示哪个图标。 */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface-elevated);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color .2s ease, border-color .2s ease, transform .2s ease;
+}
+.theme-toggle:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  transform: rotate(15deg);
+}
+.theme-toggle svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; }
+:root[data-theme="dark"] .theme-toggle .i-sun { display: none; }
+:root[data-theme="light"] .theme-toggle .i-moon { display: none; }
+
+/* ---------------------------------------------------------------- 容器 */
+.page { max-width: var(--page-max); margin: 0 auto; padding: 36px 32px 72px; }
+.page.wide { max-width: calc(var(--page-max) + 240px); }
+
+/* 分区：仍用一条线分隔（章节式阅读），卡片留给真正的"一块东西" */
+.section { border-top: 1px solid var(--border-subtle); padding-top: 22px; margin-top: 30px; }
+.section:first-child { border-top: none; margin-top: 0; padding-top: 0; }
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.section-head h2 { margin: 0; }
+
+/* "我的课程"这一行：标题与右侧按钮**居中对齐**（baseline 对齐时按钮会显得下坠），
+   并且与上面的"今天"区块留出段距 */
+.courses-head { align-items: center; margin-top: 30px; }
+.courses-head h1 { margin: 0; }
+
+/* ---------------------------------------------------------------- 按钮 */
+button {
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 15px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-elevated);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: border-color .15s, background-color .15s, color .15s,
+              transform .15s, box-shadow .2s;
+}
+button:hover:not(:disabled) { border-color: var(--border-strong); }
+button:active:not(:disabled) { transform: translateY(1px); }
+button:disabled { color: var(--text-muted); cursor: not-allowed; }
+
+/* 主按钮：强调色渐变 + 一层同色辉光（设计稿里唯一允许"发光"的地方） */
+button.primary {
+  background: linear-gradient(135deg, var(--accent), var(--agent-planner));
+  border-color: transparent;
+  color: var(--accent-on);
+  font-weight: 500;
+  box-shadow: 0 4px 14px var(--accent-glow);
+}
+button.primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px var(--accent-glow);
+}
+button.primary:active:not(:disabled) { transform: translateY(0); }
+
+button.ghost { border-color: transparent; background: transparent; color: var(--text-soft); padding: 7px 10px; }
+button.ghost:hover:not(:disabled) { color: var(--accent); border-color: transparent; background: var(--accent-soft); }
+
+/* 危险动作（删除课程）：平时保持安静，只在悬停时现出错误色。
+   一排课程里全是红按钮会让人紧张，而删除本来就不该是"顺手一点"的动作；
+   真正的拦截在确认框里（见 dashboard.js）。 */
+button.ghost.danger:hover:not(:disabled) { color: var(--err); background: var(--bg-surface-elevated); }
+
+/* 链接式按钮：语义上是 <a>（可新开标签、可复制地址），外观与按钮一致 */
+a.button {
+  display: inline-block;
+  font-size: 14px;
+  padding: 8px 15px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-elevated);
+  color: var(--text-primary);
+  white-space: nowrap;
+  transition: border-color .15s, background-color .15s, transform .15s, box-shadow .2s;
+}
+a.button:hover { border-color: var(--border-strong); text-decoration: none; }
+a.button.primary {
+  background: linear-gradient(135deg, var(--accent), var(--agent-planner));
+  border-color: transparent;
+  color: var(--accent-on);
+  box-shadow: 0 4px 14px var(--accent-glow);
+}
+a.button.primary:hover { transform: translateY(-1px); box-shadow: 0 6px 20px var(--accent-glow); }
+
+/* ---------------------------------------------------------------- 表单 */
+label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--text-secondary); }
+input[type=text], input[type=number], input[type=password], textarea, select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 15px;
+  transition: border-color .15s, box-shadow .15s;
+}
+input::placeholder, textarea::placeholder { color: var(--text-muted); }
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+textarea { resize: vertical; min-height: 76px; line-height: 1.65; }
+.field { margin-bottom: 20px; }
+.field .hint { font-size: 13px; color: var(--text-secondary); margin-bottom: 8px; line-height: 1.7; }
+
+/* ---------------------------------------------------------------- 徽标 */
+.badge {
+  display: inline-block;
+  font-size: 12px;
+  line-height: 1.7;
+  padding: 0 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  background: var(--bg-surface-elevated);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* 语义徽标：底色取同色低透明度，与主题无关地读得出"这是成功/注意/错误" */
+.badge-ok     { color: var(--ok);   border-color: var(--ok);   background: var(--bg-surface); }
+.badge-warn   { color: var(--warn); border-color: var(--warn); background: var(--bg-surface); }
+.badge-err    { color: var(--err);  border-color: var(--err);  background: var(--bg-surface); }
+.badge-accent { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+/* 顶栏那个环境徽标是个 <a>（点它去设置），所以要把链接的下划线/变色压掉，
+   否则它会同时"长着徽标的样子"和"长着链接的样子"。 */
+a.badge { color: var(--text-secondary); text-decoration: none; }
+a.badge:hover { text-decoration: none; border-color: var(--border-strong); color: var(--text-primary); }
+a.badge.badge-ok:hover   { color: var(--ok); }
+a.badge.badge-warn:hover { color: var(--warn); }
+
+/* ---------------------------------------------------------------- 提示条 */
+.notice {
+  font-size: 14px;
+  padding: 11px 14px;
+  border: 1px solid var(--border-subtle);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  margin-bottom: 16px;
+  background: var(--bg-surface);
+  line-height: 1.7;
+}
+.notice-warn  { border-left-color: var(--warn);   color: var(--warn); }
+.notice-ok    { border-left-color: var(--ok);     color: var(--ok); }
+.notice-error { border-left-color: var(--err);    color: var(--err); }
+.notice-info  { border-left-color: var(--accent); color: var(--text-secondary); }
+
+/* 气泡里的常驻告警（保存失败这类）。它不自动消失，所以要跟正文分开一点；
+   但也别撑太开——它不是这一轮的主要内容，只是"有件事没成"。 */
+.bubble .alert-note { margin-bottom: 12px; }
+
+/* ---------------------------------------------------------------- 步骤与看板（新建课程）
+
+   五个步骤都在这一页里，所以指示器只需要回答"现在在哪一步"：
+   圆形编号 + 连线（设计稿的 stepper 形态）——走过的填灰、当前的填渐变强调色。 */
+.steps { list-style: none; display: flex; margin: 0 0 30px; padding: 0; }
+.steps li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1 1 0;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  transition: color .15s;
+}
+/* 节点之间的连线：伪元素排在编号与文字之后，正好伸向下一个节点 */
+.steps li::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 2px;
+  background: var(--border-subtle);
+  border-radius: var(--radius-full);
+}
+.steps li:last-child::after { display: none; }
+.steps li .num {
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  font-weight: 600;
+  margin-right: 0;
+  transition: all .2s ease;
+}
+.steps li.is-done { color: var(--text-secondary); }
+.steps li.is-done .num { background: var(--ok); border-color: var(--ok); color: var(--accent-on); }
+.steps li.is-done::after { background: var(--ok); }
+.steps li.is-current { color: var(--text-primary); font-weight: 600; }
+.steps li.is-current .num {
+  background: linear-gradient(135deg, var(--accent), var(--agent-planner));
+  border-color: transparent;
+  color: var(--accent-on);
+  box-shadow: 0 2px 8px var(--accent-glow);
+}
+
+/* 左栏是"这一步要填什么"，右栏看板是"这门课现在长什么样"——
+   两者职责不同，所以是并排的两栏，而不是把同一份内容写两遍。 */
+.intake-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 36px;
+  align-items: start;
+}
+.intake-main { min-width: 0; }
+
+/* 看板：跟着滚动贴在旁边（top 让开顶栏的高度），窄屏下改回普通块 */
+.intake-aside {
+  position: sticky;
+  top: calc(var(--topbar-h) + 20px);
+  padding: 18px 20px 20px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+.aside-title { margin: 0 0 4px; font-size: 14px; }
+.aside-hint { margin: 0 0 12px; font-size: 12px; color: var(--text-muted); line-height: 1.6; }
+.aside-row {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 8px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 13px;
+}
+.aside-label { color: var(--text-muted); }
+.aside-value { overflow-wrap: anywhere; }
+
+/* ---------------------------------------------------------------- 三选一的选项
+
+   卡片式：选中时左边框换成强调色、底色微微抬起——一眼能看出选的是哪一张。 */
+.choices { display: flex; flex-direction: column; gap: 10px; margin: 16px 0 20px; }
+
+/* 设置页里的档位选择：横着排。
+   竖排（`new` 页的默认）适合"每个选项都有长解释"，而设置页的档位
+   只有一行小字——竖排会让四项占掉整屏高度，得滚着看才能比较。
+   `flex-wrap` 是必需的：窄窗口下它们要能换行，而不是被压成一条。 */
+.choices-inline {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+}
+.choices-inline .choice {
+  flex: 1 1 150px;
+  min-width: 130px;
+  padding: 10px 12px;
+}
+/* 横排时那句解释短一点：它只是"为什么有这个档位"，不是主体 */
+.choices-inline .choice-note {
+  font-size: 12px;
+  line-height: 1.5;
+}
+.choices-inline .choice-body strong { font-size: 13px; }
+
+.choice {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 15px 17px;
+  border: 1px solid var(--border-subtle);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  cursor: pointer;
+  transition: border-color .15s, box-shadow .2s, background-color .15s;
+}
+.choice:hover { border-left-color: var(--accent); box-shadow: var(--shadow-sm); }
+.choice:has(input:checked) {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: var(--shadow-sm);
+}
+.choice input { margin-top: 4px; accent-color: var(--accent); }
+
+.choice-body { display: flex; flex-direction: column; gap: 4px; }
+.choice-body strong { font-size: 14px; }
+.choice-note { color: var(--text-secondary); font-size: 13px; line-height: 1.65; }
+/* 严格模式那条提醒用注意色：它说的是"你得先做一件事"，不是普通说明 */
+.choice-warn { color: var(--warn); font-size: 12px; line-height: 1.65; }
+
+/* 资料预览列表：文件名在左、读到什么在右，对齐成两列 */
+.material-files { padding-left: 0; }
+.material-files li { display: flex; justify-content: space-between; gap: 12px; }
+
+/* 提示里的示例文件名：等宽 + 淡底，与说明文字区分开 */
+.hint code {
+  background: var(--bg-surface-elevated);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- 空状态 */
+.empty {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-lg);
+  padding: 30px 22px;
+  background: var(--bg-surface);
+  text-align: left;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+.empty strong { display: block; color: var(--text-primary); font-size: 15px; margin-bottom: 6px; }
+
+/* ---------------------------------------------------------------- 今天（工作台顶部）
+
+   Bento 的第一块：日期是**排版元素**（大号数字），待办才是内容。
+   整块收成一张卡片——工作台从这个网格开始，一眼看出"先做今天的事"。 */
+.today {
+  display: grid;
+  /* 日期列按**内容**宽度，不能写死像素：28px 字号下的 "2026年10月7日" 要 250px
+     上下，而写死 200px（再减掉分隔线那 20px）会把日期折成两行
+     ——"2026年10月7" / "日"，实测就是这样。
+     右边那一列是 `minmax(0, 1fr)`，日期再长也让得出空间。 */
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 32px;
+  padding: 22px 24px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  overflow: hidden;
+}
+/* 右上角一圈淡淡的光斑（设计稿里焦点卡片的做法）：
+   它只是把视线引到"今天"，不承载任何信息，所以极淡、且不拦点击。 */
+.today::before {
+  content: "";
+  position: absolute;
+  top: -70px;
+  right: -60px;
+  width: 220px;
+  height: 220px;
+  background: radial-gradient(circle, var(--accent-soft) 0%, transparent 70%);
+  pointer-events: none;
+}
+.today-date {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  border-right: 1px solid var(--border-subtle);
+  padding-right: 20px;
+}
+
+/* 日期选择器：年 / 月 / 日各占一列，每列是"上箭头 / 数字 / 单位 / 下箭头"。
+   为什么拆成三列而不是一个整体日期框：用户常改的往往只是"明天"或"上个月"，
+   拆开之后一次点击就到，不用先选中再打字。 */
+.date-picker {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+.date-field {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+  min-width: 62px;
+}
+/* `tabular-nums` 不是装饰：数字等宽之后，"12月 → 1月"这种位数变化不会让
+   整行横着抖一下（三个数字里任何一位变了都只重画那个字）。 */
+.date-value {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.date-unit { font-size: 12px; color: var(--text-muted); }
+.date-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 19px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color .15s ease, background-color .15s ease;
+}
+.date-step:hover { color: var(--accent); background: var(--bg-surface-elevated); }
+.date-step svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.date-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+}
+.today-week { font-size: 13px; color: var(--text-muted); }
+
+/* 待办那一列**固定一个舒服的宽度**，不跟着窗口无限拉长：一条待办就一句话，
+   拉成一千像素宽之后眼睛要横着扫很久。 */
+.todo {
+  display: flex;
+  flex-direction: column;
+  max-width: 420px;
+}
+
+/* 标题和输入框都摆在列表外面、且 `flex: 0 0 auto`——列表滚的时候它们不动。
+   这是"顺手"的关键：写一条新的永远够得着，不用先滚回列表底部。 */
+.todo-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.todo-head h2 { margin: 0; font-size: 15px; }
+
+/* 列表是这块**唯一会长的那部分**，所以高度按"大约七条"直接定死：
+   整块就不再随条数忽高忽低（空的时候也是一个安静的框，不是塌掉的一条）。
+   多出来的部分在这里自己滚，不影响页面；`overscroll-behavior: contain`
+   让滚到头之后不把整页带走——否则"再滚一下"会把用户甩到课程区去。 */
+.todo-list {
+  flex: 0 0 auto;
+  height: 252px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* 滚动条出现/消失不该让文字左右跳一格：从"6 条"到"7 条"正好跨过那条线 */
+  scrollbar-gutter: stable;
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+
+/* 一条待办：勾选框 + 文字 + 删除。删除按钮平时藏着（一列 × 会抢注意力），
+   悬停那一行才出现；触摸设备没有悬停，所以下面用 `hover: none` 让它常显。 */
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 6px 8px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  transition: background-color .15s ease;
+}
+.todo-item:hover { background: var(--bg-surface-elevated); }
+
+.todo-check {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1.5px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  /* 勾是**画出来的**、先涂成透明：勾上时只换颜色，不会引起重排 */
+  color: transparent;
+  cursor: pointer;
+  transition: color .15s ease, background-color .15s ease, border-color .15s ease;
+}
+.todo-check:hover { border-color: var(--accent); }
+.todo-check svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.todo-item.is-done .todo-check {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-on);
+}
+
+.todo-text { flex: 1 1 auto; overflow-wrap: anywhere; }
+/* 做完的划掉并压暗，**但不删行**——"我做过了什么"本身是信息 */
+.todo-item.is-done .todo-text {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+
+.todo-remove {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s ease, color .15s ease;
+}
+.todo-item:hover .todo-remove,
+.todo-remove:focus-visible { opacity: 1; }
+.todo-remove:hover { color: var(--err); }
+.todo-remove svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+@media (hover: none) {
+  .todo-remove { opacity: 1; }
+}
+.todo-empty { color: var(--text-muted); }
+
+.todo-form { flex: 0 0 auto; display: flex; gap: 8px; }
+.todo-form input { flex: 1; }
+
+/* ---------------------------------------------------------------- 记事
+   选中日期的自由记录。它跟着"今天"那一块走（同宽、同一列），
+   所以换日期时两边的日期感是一致的。 */
+.day-note {
+  margin-top: 20px;
+  padding: 20px 24px 18px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+.day-note-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.day-note-head h2 { margin: 0; font-size: 15px; }
+#note-text {
+  width: 100%;
+  min-height: 120px;
+  max-height: 320px;
+  padding: 11px 13px;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.7;
+}
+
+/* ---------------------------------------------------------------- 课程卡片（工作台） */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 18px;
+}
+
+/* 卡片：圆角 + 1px 线 + 柔和阴影；悬停时轻轻抬起。
+   整站"一块可以拿起来的东西"都用这个形状。 */
+.course-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 22px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-sm);
+  transition: transform .18s ease, box-shadow .2s ease, border-color .18s ease;
+}
+.course-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-md);
+}
+
+.card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.card-title { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.4; }
+.card-title a { color: var(--text-primary); }
+.card-title a:hover { color: var(--accent); text-decoration: none; }
+/* 徽标行：可能有两枚（大纲状态 + 内容来源） */
+.card-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: -2px; }
+
+.card-progress { font-size: 14px; color: var(--text-secondary); }
+.card-progress .num { color: var(--text-primary); font-weight: 600; }
+.card-progress .slash { color: var(--text-muted); margin: 0 1px; }
+.card-progress-label { margin-left: 4px; }
+
+/* 进度条：6px 圆角 + 强调色渐变（与主按钮同一套颜色） */
+.progress-line {
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--bg-surface-elevated);
+  position: relative;
+  overflow: hidden;
+}
+.progress-line i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: var(--radius-full);
+  background: linear-gradient(90deg, var(--accent), var(--agent-visual));
+  display: block;
+  transition: width .6s cubic-bezier(.4, 0, .2, 1);
+}
+
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 2px;
+}
+
+/* 图标按钮：无边框、悬停才出底色；危险动作只在悬停时变红 */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-muted);
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+.icon-btn:hover:not(:disabled) { color: var(--text-primary); border-color: var(--border-subtle); background: var(--bg-surface-elevated); }
+.icon-btn.danger:hover:not(:disabled) { color: var(--err); border-color: var(--err); background: var(--bg-surface); }
+.icon-btn:disabled { opacity: .45; }
+
+/* 概览数字 */
+.stat { display: flex; align-items: baseline; gap: 8px; }
+.stat-value { font-size: 30px; font-weight: 700; line-height: 1.1; }
+.stat-label { font-size: 13px; color: var(--text-secondary); }
+
+/* 所有课程合起来的进度 */
+.overall { margin-top: 12px; max-width: 420px; }
+
+/* ================================================================ 课程页双栏 */
+.workbench {
+  display: grid;
+  grid-template-columns: 296px minmax(0, 1fr);
+  height: calc(100vh - var(--topbar-h));
+  height: calc(100dvh - var(--topbar-h)); /* 新版视口单位：移动端地址栏收起时更准 */
+}
+
+/* ---- 左栏：章节时间轴 ---- */
+.sidebar {
+  border-right: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  overflow-y: auto;
+  padding: 20px 0 40px;
+}
+.sidebar-head { padding: 0 20px 14px; border-bottom: 1px solid var(--border-subtle); }
+.sidebar-head .title { font-size: 15px; font-weight: 600; }
+.sidebar-head .sub { font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+/* 回列表的入口。做小、做轻：它是一条退路，不该跟课程标题抢注意力。 */
+.back-link { display: inline-block; margin-bottom: 10px; font-size: 12px; color: var(--text-muted); }
+.back-link:hover { color: var(--accent); }
+
+/* 时间轴：一条竖线 + 节点 */
+.timeline { list-style: none; margin: 0; padding: 14px 20px 0; position: relative; }
+.timeline::before {
+  content: "";
+  position: absolute;
+  left: 25px;
+  top: 14px;
+  bottom: 0;
+  width: 1px;
+  background: var(--border-subtle);
+}
+
+.chapter-node { position: relative; margin-bottom: 4px; }
+.chapter-node > button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  padding: 8px 10px 8px 22px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  position: relative;
+  transition: background-color .15s, color .15s;
+}
+.chapter-node > button:hover { color: var(--accent); background: var(--bg-surface-elevated); }
+.chapter-node > button::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 16px;
+  width: 7px;
+  height: 7px;
+  background: var(--bg-surface);
+  border: 2px solid var(--border-strong);
+  border-radius: var(--radius-full);
+  z-index: 1;
+}
+.chapter-node.is-current > button::before { border-color: var(--accent); background: var(--accent); }
+.chapter-count { color: var(--text-muted); font-weight: 400; font-size: 12px; }
+
+.point-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.point-list li { position: relative; }
+.point-list button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  padding: 7px 10px 7px 22px;
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.55;
+  border-radius: var(--radius-sm);
+  position: relative;
+  font-weight: 400;
+  transition: background-color .15s, color .15s;
+}
+.point-list button:hover { color: var(--accent); background: var(--bg-surface-elevated); }
+/* 节点三态：已讲实心 / 正在讲带环 / 未讲空心 */
+.point-list button::before {
+  content: "";
+  position: absolute;
+  left: 1px;
+  top: 13px;
+  width: 5px;
+  height: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  z-index: 1;
+}
+.point-list li.is-done button::before { background: var(--ok); border-color: var(--ok); }
+.point-list li.is-done button { color: var(--text-muted); }
+.point-list li.is-done button:hover { color: var(--text-secondary); }
+.point-list li.is-current button { color: var(--text-primary); font-weight: 600; background: var(--accent-soft); }
+.point-list li.is-current button::before {
+  background: var(--accent);
+  border-color: var(--accent);
+  outline: 3px solid var(--accent-soft);
+}
+
+/* ---- 右栏：对话区 ---- */
+/* min-height: 0 是这里的关键：flex 子项默认 min-height:auto，
+   内容一多就会把容器撑高，overflow-y 随之失效、整页被拉长。 */
+.chat-area {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-app);
+  position: relative;
+}
+
+/* ---- 对话区顶部状态栏与协作轨 ---- */
+.chat-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-shrink: 0;
+  padding: 10px 32px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.chat-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 16px 32px 24px; }
+
+/* 协作轨：显示谁在动手（备课 / 取资料 / 讲 / 画图） */
+.crew {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.crew-node {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  padding: 2px 8px;
+  white-space: nowrap;
+  transition: all .2s ease;
+}
+.crew-node::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--crew-color, var(--border-strong));
+  opacity: .4;
+  transition: opacity .2s, box-shadow .25s, transform .2s;
+}
+/* 身份色：智能体是谁，就用谁的色（色号只在基座里定义一次） */
+.crew-node[data-agent="lesson-planner"] { --crew-color: var(--agent-lesson-planner); }
+.crew-node[data-agent="material-reader"] { --crew-color: var(--agent-material); }
+.crew-node[data-agent="lecturer"] { --crew-color: var(--agent-lecturer); }
+.crew-node[data-agent="visual"] { --crew-color: var(--agent-visual); }
+
+.crew-node.is-busy {
+  color: var(--text-primary);
+  font-weight: 600;
+  border-color: var(--crew-color);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-sm);
+}
+.crew-node.is-busy::before {
+  opacity: 1;
+  animation: crew-breathe 1.8s ease-in-out infinite;
+}
+
+/* 忙碌的呼吸：圆点轻轻胀缩 + 同色辉光（设计稿的 pulse 一脉） */
+@keyframes crew-breathe {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 6px currentColor; }
+  50% { transform: scale(1.4); box-shadow: 0 0 12px currentColor; }
+}
+
+/* 正文列居中，宽度跟着界面偏好的"内容宽度"走（默认 920px）。
+   两侧留白对称，读起来不再像挤在左半边。 */
+.chat { display: flex; flex-direction: column; max-width: var(--chat-max); margin: 0 auto; width: 100%; }
+
+/* 按知识点分组的"路标" */
+.chat-group { margin-bottom: 24px; }
+.chat-group:last-child { margin-bottom: 0; }
+
+/* 段落分界：随内容滚动，**不做 sticky** —— 固定住的标题条会一直压着正文
+   （实测被反馈"挡视野"）。"现在在哪一段"交给右边进度尺负责。 */
+.chat-section {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 16px;
+  padding: 0;
+  border: none;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: var(--text-secondary);
+}
+/* 一条渐变短线做段落起头：比整行下划线轻，又比什么都没有更容易定位 */
+.chat-section::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--border-strong), transparent);
+}
+
+/* ---------------------------------------------------------------- 进度尺
+   贴右边缘的可折叠小窗。折叠时整块面板滑出屏幕，只剩最左边那个按钮卡在边缘上
+   （按钮是面板的子元素，面板平移 100% 时它正好停在边缘——这就是"折叠到右边缘"）。
+
+   它管两件事：这一节走到第几步（刻度），以及讲过的知识点在哪（索引）。
+   展开时**给正文让出宽度**（body.rail-open），而不是盖在正文上。 */
+.rail {
+  position: fixed;
+  top: var(--topbar-h);
+  right: 0;
+  bottom: 0;
+  width: 296px;
+  display: flex;
+  background: var(--bg-glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-left: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  transform: translateX(100%);
+  transition: transform .18s ease;
+  z-index: 20;
+}
+.rail.is-open { transform: translateX(0); }
+
+.rail-toggle {
+  position: absolute;
+  left: -40px;
+  top: 18px;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  /* 方形（用户要求）：位置与高度不变，只是不再做成圆形。
+     圆角收到 --radius-sm——仍是这套界面里"一档"的圆角，不会显得突兀。 */
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.rail-toggle:hover { color: var(--accent); border-color: var(--accent); }
+/* 折叠时朝左（"拉开"），展开时朝右（"收起"）——纯 CSS 画的箭头，不用字符图标 */
+.rail-caret {
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-right: 6px solid currentColor;
+  transition: transform .18s ease;
+}
+.rail.is-open .rail-caret { transform: rotate(180deg); }
+
+.rail-body {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 20px 22px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+.rail-block { display: flex; flex-direction: column; gap: 10px; }
+.rail-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.rail-point { font-size: 15px; font-weight: 600; line-height: 1.45; }
+
+/* 刻度：一步一格。已讲过的是深线，当前一步是强调色渐变，没讲的是浅线 */
+.rail-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.rail-steps li { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-muted); }
+.rail-steps li i { flex: 1; height: 4px; border-radius: var(--radius-full); background: var(--bg-surface-elevated); }
+.rail-steps li.is-done { color: var(--text-secondary); }
+.rail-steps li.is-done i { background: var(--border-strong); }
+.rail-steps li.is-current { color: var(--text-primary); font-weight: 600; }
+.rail-steps li.is-current i { background: linear-gradient(90deg, var(--accent), var(--agent-planner)); }
+
+.rail-note { margin: 0; font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
+
+/* "讲到过"：点一条跳回那一段 */
+.rail-index { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.rail-index li { border-bottom: 1px solid var(--border-subtle); }
+.rail-index button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 9px 0 9px 13px;
+  border: none;
+  background: none;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  position: relative;
+  transition: color .15s, background-color .15s;
+}
+.rail-index button::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 16px;
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-full);
+}
+.rail-index button:hover { color: var(--accent); background: var(--bg-surface-elevated); }
+.rail-index button.is-current { color: var(--text-primary); font-weight: 600; }
+.rail-index button.is-current::before { background: var(--accent); border-color: var(--accent); }
+/* "第 N 次"：同名知识点又讲了一遍时的区分标记，比标题淡一档 */
+.rail-order {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+.rail-empty { padding: 8px 0; color: var(--text-muted); font-size: 13px; }
+
+/* "存下的讲义"：列出这次打开期间落盘的文件路径。
+   路径用等宽字体、可断行——中文目录名很长，不断行会把这一栏撑破。 */
+.rail-files { list-style: none; margin: 0; padding: 0; }
+.rail-files li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.rail-file-kind { flex-shrink: 0; font-size: 12px; color: var(--text-muted); }
+.rail-file-path {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+/* 进度尺展开时，给正文让出同样的宽度（不是盖上去） */
+body.rail-open .workbench { padding-right: 296px; }
+
+/* "系统正在怎么适应你"：系统根据学生反馈动态调整的一句话。
+   空的时候整条不占位（:empty）——不要显示"暂无调整"，那只是噪音，
+   还暗示"系统什么都没做"。 */
+.adaptation {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  min-width: 0;
+  text-align: right;
+  transition: all .2s ease;
+}
+.adaptation:empty { display: none; }
+
+.bubble {
+  border-radius: var(--radius-lg);
+  /* 注意这里**不用 `both`**：填充模式一旦把首帧的 opacity:0 固定下来，
+     动画没跑（或被打断）时消息会整条看不见。不收尾、让元素回到自身样式更安全。 */
+  animation: fade-in .22s ease;
+}
+.bubble + .bubble { margin-top: 18px; }
+.bubble.user {
+  align-self: flex-end;
+  max-width: 80%;
+  background: var(--accent-soft);
+  border: 1px solid var(--border-subtle);
+  border-right: 3px solid var(--accent);
+  padding: 12px 16px;
+}
+/* 智能体的消息卡片：**用说话者自己的身份色**做左边框与铭牌色
+   （设计稿里的 Lecturer 琥珀 / Visual 翠绿 / Observer 玫瑰）。
+   现在真正会出现在对话里的只有讲师与图解两类，其余按同一规则预留。 */
+.bubble.agent {
+  align-self: stretch;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-left: 4px solid var(--agent-lecturer);
+  padding: 18px 22px;
+  box-shadow: var(--shadow-sm);
+}
+.bubble.agent[data-agent="visual"] { border-left-color: var(--agent-visual); }
+.bubble.agent[data-agent="observer"] { border-left-color: var(--agent-observer); }
+.bubble.agent[data-agent="lesson-planner"] { border-left-color: var(--agent-lesson-planner); }
+
+.bubble .meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+/* 铭牌（"讲师""图解"）：做成身份色的胶囊，一眼看出是谁在讲
+   （设计稿里 speaker-avatar-wrap 的那层边光，这里落在胶囊描边上）。 */
+.bubble.agent .meta > span:first-child {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 9px;
+  border: 1px solid var(--agent-lecturer);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface-elevated);
+  color: var(--agent-lecturer);
+  font-weight: 600;
+}
+.bubble.agent[data-agent="visual"] .meta > span:first-child {
+  border-color: var(--agent-visual);
+  color: var(--agent-visual);
+}
+/* 阶段文字（"备课中" / "讲课中"）：比其余 meta 稍亮一点，
+   它是"现在在做什么"的实时状态，不该跟标签一样淡。 */
+.bubble .meta .phase { color: var(--text-secondary); }
+.bubble .body > :first-child { margin-top: 0; }
+.bubble .body > :last-child { margin-bottom: 0; }
+.bubble .body h3, .bubble .body h4 { margin-top: 18px; }
+.bubble .body ul, .bubble .body ol { margin: 0 0 12px; padding-left: 22px; }
+.bubble .body li { margin-bottom: 4px; }
+
+/* 流式输出时的光标 */
+.cursor::after {
+  content: "▍";
+  color: var(--accent);
+  animation: blink 1s steps(2, start) infinite;
+}
+@keyframes blink { to { visibility: hidden; } }
+
+/* 新内容轻轻浮上来（消息、看板条目都用这一条） */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 输入区固定在右栏底部。整体收小一档（使用者 2026-09 要求）：
+   芯片更矮、输入框更薄、发送按钮更小——把高度留给上面的讲解。 */
+.composer-bar {
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border-subtle);
+  padding: 10px 24px 12px;
+}
+.composer { display: flex; gap: 8px; align-items: flex-end; max-width: var(--chat-max); margin: 0 auto; width: 100%; }
+.composer textarea {
+  flex: 1;
+  min-height: 34px;
+  max-height: 120px;
+  padding: 7px 11px;
+  font-size: 14px;
+}
+.composer .primary { padding: 6px 14px; font-size: 13px; }
+
+/* 快捷追问 + 画成图解：点一下等于把那句话打出来。
+   胶囊形状 + 悬停时轻轻抬起（设计稿里的 intent chips）。
+   这一排是输入区的一部分，**原来输入框下面那行说明文字已经删掉**——
+   可点的芯片比让人照着说明打字更直接，也少一行占高。 */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 880px;
+  margin: 0 auto;
+  padding-bottom: 7px;
+}
+.chip {
+  font-size: 12px;
+  padding: 3px 11px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+}
+.chip:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px var(--accent-soft);
+}
+/* "画成图解"与其余的追问芯片**同一个样式**（使用者 2026-09 要求）：
+   它触发的是动作、追问触发的是说话，但两者都是"点一下帮我做件事"，
+   所以不额外给强调色——亮着的那一个会显得像被选中的状态。 */
+
+/* ================================================================ 内容排版 */
+pre.code {
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+/* 表格：细线网格，表头浅底。讲师常给"对照表/判据表"，必须能看清 */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 16px 0;
+  font-size: 14px;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+th, td {
+  border: 1px solid var(--border-subtle);
+  padding: 8px 11px;
+  vertical-align: top;
+  line-height: 1.6;
+}
+th {
+  background: var(--bg-surface-elevated);
+  font-weight: 600;
+}
+td .faint { color: var(--text-muted); }
+code {
+  background: var(--bg-surface-elevated);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  font-size: .92em;
+}
+pre.code code { background: none; padding: 0; }
+
+/* 公式（KaTeX）：块级公式给一层淡底 + 圆角，与正文分开——
+   长推导里它能一眼被认出来，不必靠数括号找边界。 */
+.katex { font-size: 1.05em; }
+.katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; margin: 12px 0; }
+.katex-display > .katex { white-space: normal; }
+/* 块级公式被插件包在 <p class="katex-block"> 里（VS Code 同样如此）：
+   收掉外层段落的边距，免得与 .katex-display 的边距叠成一大块空白 */
+.katex-block {
+  position: relative;
+  margin: 14px 0;
+  padding: 12px 16px;
+  background: var(--accent-soft);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow-x: auto;
+}
+.katex-block > .katex-display { margin: 0; }
+
+/* 公式块右上角的"复制源码"：默认安静，悬停或键盘聚焦才现出来
+   （长推导里满屏按钮会跟公式打架）。触摸设备没有悬停，就让它常显。 */
+.formula-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 2px 9px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  opacity: 0;
+  transition: opacity .15s, color .15s, border-color .15s;
+}
+.katex-block:hover .formula-copy,
+.formula-copy:focus-visible { opacity: 1; }
+.formula-copy:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+@media (hover: none) {
+  .formula-copy { opacity: 1; }
+}
+/* 渲染不出来时回退显示源码（绝不吞内容）——用注意色，让人知道这处要重试 */
+.tex-fallback {
+  background: var(--bg-surface-elevated);
+  border: 1px dashed var(--warn);
+  border-radius: var(--radius-sm);
+  color: var(--warn);
+  padding: 1px 5px;
+  white-space: pre-wrap;
+}
+
+/* 引用 / 图片 / 水平线 / 链接：这些结构是换 markdown-it 之后才有的。
+   作用域限定在课程正文气泡里，不碰页面自身的链接与图标。 */
+.bubble .body blockquote {
+  margin: 0 0 14px;
+  padding: 4px 14px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-surface-elevated);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  color: var(--text-secondary);
+}
+.bubble .body blockquote > :last-child { margin-bottom: 0; }
+.bubble .body img {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.bubble .body hr {
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  margin: 18px 0;
+}
+.bubble .body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* 图解（Mermaid）：给图纸一块干净的底，与正文分开。
+   点一下能放大——复杂的图在气泡宽度里根本看不清（设计稿里的"放大查看"）。
+   **默认限高**：一张大图会把同一轮的讲解挤出屏幕，重点就不突出了；
+   限高之后图自己滚动，想看全的点开全屏。 */
+.diagram {
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  max-height: min(52vh, 420px);
+  overflow: auto;
+  cursor: zoom-in;
+}
+.diagram svg { max-width: 100%; height: auto; }
+.diagram-fallback { font-size: 13px; }
+
+/* 全屏看图：点遮罩任意处或按 Esc 关掉。图纸本身可以横向滚动平移，
+   但不做缩放控件——缩放交给浏览器的 Ctrl+滚轮，比自造一套手势更省事。 */
+.diagram-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: var(--overlay);
+  cursor: zoom-out;
+  overflow: auto;
+  animation: fade-in .15s ease;
+}
+.diagram-modal-body {
+  max-width: 96vw;
+  max-height: 92vh;
+  overflow: auto;
+  padding: 24px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+.diagram-modal-body svg { max-width: none; height: auto; }
+
+/* ---------------------------------------------------------------- 加载 */
+.spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: var(--radius-full);
+  animation: spin .8s linear infinite;
+  vertical-align: -2px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 右下角轻提示 */
+.toast {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 999;
+  max-width: 420px;
+  padding: 11px 15px;
+  font-size: 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  animation: fade-in .2s ease;
+}
+
+/* 右对齐的操作行 */
+.row-end { display: flex; justify-content: flex-end; gap: 10px; align-items: center; }
+
+/* ---------------------------------------------------------------- 设置页 */
+/* 设置页的卡片**一律**这个宽度——不管它在不在 `<form>` 里。
+   原先只有两张表单卡片受 `.settings-form` 的 620px 限制，另外几张
+   （快捷键 / 我的画像 / 文件位置 / 关于）在 form 外面，于是它们撑到了页面的
+   全宽（实测：表单卡片右边界 1018、其余 1254）——同一个页面里两种卡片宽度，
+   左右边界对不齐，看起来像没排完版。
+   为什么是 620 而不是更宽：整宽的输入框在宽屏上会拉成一条，
+   眼睛要横着扫很久才读完一个端点地址。 */
+.settings-form, .setting-card { max-width: 620px; }
+.settings-form .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+/* 带后缀的输入框（温度旁边的 0–2 说明、目录旁边的"打开"按钮） */
+.input-suffix { display: flex; align-items: center; gap: 10px; }
+.input-suffix > input { flex: 1 1 auto; }
+.input-suffix > .suffix { flex: 0 0 auto; font-size: 13px; color: var(--text-muted); }
+
+/* 密钥输入框 + "换一个" + "清除" 一行排开 */
+.key-row { display: flex; align-items: center; gap: 10px; }
+/* 右边那两个按钮**不参与压缩**，文字也不许折行：上面那个输入框是
+   `flex: 1 1 auto`，不挡住的话按钮会被压到只剩一个字宽——实测"换一个"
+   会变成竖排的"换 / 一 / 个"。 */
+.key-row > button { flex: 0 0 auto; white-space: nowrap; }
+/* 密钥用等宽：粘贴时一眼能看出有没有多带空格 */
+.key-row > input {
+  flex: 1 1 auto;
+  font-family: "Fira Code", "JetBrains Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
+}
+
+/* 每张设置卡片：一组相关的项 */
+.setting-card {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 22px 24px 8px;
+  margin-bottom: 20px;
+  background: var(--bg-surface);
+}
+.setting-card > h2 { margin: 0 0 6px; font-size: 15px; }
+.setting-card > .hint { margin: 0 0 20px; font-size: 13px; color: var(--text-secondary); line-height: 1.7; }
+
+/* "已经配好了 / 还没配"这一行状态 */
+.status-line { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; font-size: 13px; }
+.status-line .path {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* 卡片收尾那一行：`.setting-card` 的底部内边距只有 8px（是给表单行留的），
+   所以带着按钮的末行要自己把空白补上，否则按钮会贴着圆角。 */
+.status-foot { padding-bottom: 14px; }
+
+/* "我的画像"那一块：一组"标签 → 值"。 */
+.fact-list { margin: 0 0 16px; display: grid; gap: 10px; }
+.fact { display: grid; grid-template-columns: 76px 1fr; gap: 12px; align-items: baseline; }
+.fact dt { color: var(--text-muted); font-size: 13px; }
+.fact dd { margin: 0; overflow-wrap: anywhere; }
+
+/* 快捷键那一块用的是同一种"标签 → 说明"结构，但**键位列要按内容宽度**：
+   画像那边的 76px 装不下 "Ctrl / Alt + 1 · 2 · 3"，会被折成三行
+   （"Ctrl / Alt" / "+ 1 · 2 ·" / "3"）——实测过，很难看也读不懂。 */
+.shortcut-list .fact { grid-template-columns: max-content minmax(0, 1fr); }
+.shortcut-list dt { white-space: nowrap; }
+
+/* 画像是模型写的 Markdown。这一段复用对话气泡里那套排版
+   （见 `.bubble .body` 那一组规则）——不自己再写一份，
+   否则同一段 Markdown 在画像里和在讲义里会长得不一样。 */
+.profile-summary { margin: 0; }
+.profile-summary > :first-child { margin-top: 0; }
+.profile-summary > :last-child { margin-bottom: 0; }
+.profile-summary h3, .profile-summary h4 { margin-top: 16px; font-size: 15px; }
+.profile-summary ul, .profile-summary ol { margin: 0 0 12px; padding-left: 22px; }
+.profile-summary li { margin-bottom: 4px; }
+.profile-summary blockquote {
+  margin: 12px 0;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-secondary);
+}
+
+@media (max-width: 720px) {
+  .settings-form .pair { grid-template-columns: 1fr; }
+}
+
+/* ---------------------------------------------------------------- 讲义页 */
+/* 左边一列文件、右边正文——与课程页同一个思路（左列回答"去哪"，右边是"内容"），
+   所以窄屏下也一起塌成一列。间距都乘 --density：紧凑模式下这一页跟着收紧。 */
+.notes-layout {
+  display: grid;
+  grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+  gap: calc(16px * var(--density));
+  align-items: start;
+}
+
+/* 两张卡片的"长相"与设置页的 `.setting-card` 一致（同一档圆角、同一种描边），
+   免得同一个应用里出现两种卡片。 */
+.notes-list,
+.notes-view {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: calc(12px * var(--density)) calc(14px * var(--density));
+}
+
+/* 文件多起来之后列表自己滚，不把整页拉长——右边那一栏才是要读的 */
+.notes-list {
+  max-height: calc(100vh - var(--topbar-h) - 160px);
+  overflow: auto;
+}
+.notes-view { min-height: 260px; }
+
+.notes-course {
+  margin: calc(10px * var(--density)) 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.notes-course:first-child { margin-top: 0; }
+
+.notes-files { list-style: none; margin: 0; padding: 0; }
+
+/* 一份讲义是一个按钮而不是链接：点击是在**这一页里**读它，不跳转。 */
+.notes-file {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-md);
+  padding: 7px 9px;
+  cursor: pointer;
+}
+.notes-file:hover { background: var(--bg-surface-elevated); }
+/* 选中的那一份用强调色的淡底，不用边框——列表里的线条已经够多了 */
+.notes-file.is-selected { background: var(--accent-soft); }
+
+.notes-file-name { display: block; }
+.notes-file-meta {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* 正文顶上那一条：文件名 + 相对路径（路径是给人确认"这是哪一份"的） */
+.notes-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.notes-head .notes-title { font-weight: 600; }
+.notes-head > .faint { font-size: 12px; overflow-wrap: anywhere; }
+
+/* 讲义正文的排版：与"我的画像"同一套（那一份也是模型写的 Markdown），
+   不另外发明一种——同一段 Markdown 在应用里该长一个样。 */
+.notes-body { margin: 0; max-width: none; }
+.notes-body > :first-child { margin-top: 0; }
+.notes-body > :last-child { margin-bottom: 0; }
+.notes-body h3, .notes-body h4 { margin-top: 18px; }
+.notes-body ul, .notes-body ol { margin: 0 0 12px; padding-left: 22px; }
+.notes-body li { margin-bottom: 4px; }
+
+/* ---------------------------------------------------------------- 窄屏 */
+@media (max-width: 900px) {
+  .page { padding: 20px; }
+  .topbar { padding: 0 20px; }
+
+  /* 窄屏一律折叠左栏，而且**盖过用户自己的选择**：
+     900px 以下的窗口里，216px 的导航会把正文挤到没法读。
+     这里用 `!important` 是因为 `data-rail="expanded"`（用户在宽屏下的选择）
+     与这条规则的优先级相同，不加就压不过它。
+     正因为这里是强制的，左栏那个折叠开关在窄屏下会被藏掉（见 `.rail-toggle`）：
+     点了不会有反应的控件比没有更糟。 */
+  .shell { grid-template-columns: var(--rail-w-collapsed) minmax(0, 1fr) !important; }
+  .rail-nav .label { display: none !important; }
+  .rail-nav .rail-item { justify-content: center; padding: 9px 0; }
+  .rail-nav .rail-dot { display: none !important; }
+
+  /* 窄屏也保持"右栏内部滚动"，而不是整页被拉长 */
+  .workbench {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+    height: calc(100vh - var(--topbar-h));
+    height: calc(100dvh - var(--topbar-h));
+  }
+  .sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--border-subtle);
+    max-height: 34vh;
+  }
+  .chat-scroll { padding: 18px 20px; }
+  .chat-bar, .composer-bar { padding-left: 20px; padding-right: 20px; }
+
+  /* 协作轨在窄屏下与右边那句说明改为上下排 */
+  .chat-bar { flex-direction: column; align-items: flex-start; gap: 8px; padding: 12px 20px; }
+  .adaptation { text-align: left; }
+
+  /* 进度尺在窄屏下**盖在正文上**（不再让宽度）：
+     屏幕本来就窄，再让出 280px 就没法读了。 */
+  .rail { width: 280px; border-radius: 0; }
+  body.rail-open .workbench { padding-right: 0; }
+
+  /* 工作台：日期与待办在窄屏下改为上下排列 */
+  .today { grid-template-columns: 1fr; gap: 20px; padding: 18px 20px; }
+  .today-date { border-right: none; border-bottom: 1px solid var(--border-subtle); padding-right: 0; padding-bottom: 14px; }
+
+  /* 新建课程：看板挪到正文下面——窄屏并排两栏谁都读不了 */
+  .intake-layout { grid-template-columns: 1fr; gap: 24px; }
+  .intake-aside { position: static; }
+
+  /* 步骤指示器横着排不下就让它滚（窄屏下把连线收起来，否则五个节点会挤成一团） */
+  .steps { overflow-x: auto; }
+  .steps li { flex: 0 0 auto; padding-right: 18px; }
+  .steps li::after { display: none; }
+
+  /* 讲义页：两栏塌成一栏，列表限高——不限的话一屏全是文件名，
+     正文被挤到看不见的地方去了。 */
+  .notes-layout { grid-template-columns: 1fr; }
+  .notes-list { max-height: 280px; }
+}
+
+/* 系统里"关掉动画"的人：呼吸点、光标闪烁、淡入都不该继续动。
+   这一条放在最后，保证它压过前面的 animation 声明。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
+
+/* 界面偏好里显式选了"一直关掉动效"（设置 → 界面）。
+   与上面那条系统的偏好**分开写**，而不是合成一条选择器：
+   系统的偏好是"用户对这台机器的整体要求"，这一条是"他对这个应用的要求"；
+   两者各自独立生效，硬合成一条会让"系统没关、但我想关"这种情况没法表达。 */
+html[data-motion="off"] *,
+html[data-motion="off"] *::before,
+html[data-motion="off"] *::after {
+  animation-duration: .001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: .001ms !important;
+}
+
+/* ============================================================ 课堂页
+   独立页面（/course/<id>/class）：单列、占满视口。
+
+   为什么不再用"在课程页里藏左栏"的做法：`.workbench` 是
+   `grid-template-columns: 296px minmax(0, 1fr)`，把 `.sidebar` 设成
+   `display:none` 只移走了那一个**格子里的元素**，296px 这一列还在，
+   于是 `.chat-area` 落进第一列、卡片被压成 296px 宽（真实故障，
+   截图里标题一字一行就是这么来的）。分开成两级页面后，课堂有自己的骨架。 */
+
+.classroom {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: calc(100vh - var(--topbar-h));
+  height: calc(100dvh - var(--topbar-h));
+  padding: 0 24px 16px;
+}
+
+.classroom-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.classroom-point { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.classroom-pos { font-variant-numeric: tabular-nums; }
+.classroom-spacer { flex: 1 1 auto; }
+.classroom-bar button { font-size: 12px; }
+
+.classroom-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+/* 一页 = 一块可滚动的纸。课堂的面积都给它，所以这里可以宽、可以高。 */
+.slide {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 30px 40px;
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  font-size: calc(var(--reading-font) + 2px);
+  line-height: var(--reading-line);
+  color: var(--text-primary);
+}
+
+.slide.is-skipped { opacity: .66; }
+
+/* 页标题就是正文里那个 Markdown 标题（见 classroom.js 的说明）：
+   所以给它"标题的分量"，并去掉页首那道多余的上边距。
+   公式由 Markdown 渲染器处理，这里只管字号与间距。
+   （原来的 `.slide-title` 已删除：那是"从正文抽标题再单独画一次"的产物，
+     会同时导致公式不渲染与标题重复。） */
+.slide .body > h1:first-child,
+.slide .body > h2:first-child { margin-top: 0; }
+
+.slide .body h1,
+.slide .body h2 {
+  margin: 0 0 16px;
+  font-size: 22px;
+  line-height: 1.35;
+}
+
+.slide .body h3 {
+  margin: 18px 0 8px;
+  font-size: 17px;
+  line-height: 1.4;
+}
+.slide-empty { color: var(--text-muted); }
+.slide-empty-hint { font-size: 13px; }
+.slide-materials {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-subtle);
+}
+
+.slide-dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.slide-dot {
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border: 0;
+  box-sizing: border-box;
+  border-radius: var(--radius-full);
+  background: var(--border-strong);
+  cursor: pointer;
+}
+
+.slide-dot.active {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* 跳过的页用空心点（用边框而不是 inset 阴影：阴影只能用 --shadow-* 变量） */
+.slide-dot.skipped {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+}
+
+.slide-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* 一步讲完的反馈框：**自动出现**，但只占一条，不抢卡片的面积。 */
+.step-ask {
+  flex-shrink: 0;
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 12px 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-focus);
+  border-radius: var(--radius-md);
+}
+
+.step-ask-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.step-ask-sub { font-size: 12px; color: var(--text-secondary); }
+.step-ask-body { display: flex; gap: 8px; }
+.step-ask-body textarea { flex: 1 1 auto; min-height: 44px; resize: vertical; }
+.step-ask-hint { margin-top: 6px; font-size: 12px; color: var(--text-muted); }
+
+/* 课程页右上角的入口。用链接而不是按钮：它是一次页面跳转，不是动作。 */
+.classroom-entry {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 4px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  color: var(--text-primary);
+  text-decoration: none;
+}
+
+.classroom-entry:hover { border-color: var(--border-strong); }
+
+/* 课堂页要"整块屏幕"，所以连 base 的左导航也要收起来。
+   注意 `.shell` 同样是栅格：只把 `.rail-nav` 藏掉，`--rail-current` 那一列还在，
+   正文会被挤到左边一条——和课程页那个坑一模一样，所以两处都要改。 */
+body[data-page="classroom"] .rail-nav { display: none; }
+body[data-page="classroom"] .shell { grid-template-columns: minmax(0, 1fr); }
+body[data-page="classroom"] .shell-body { min-height: 0; overflow: hidden; }
+
+/* ============================================================ 小测面板
+   课堂里的第三个状态（讲授 → 反馈 → 小测）。
+   它铺满课堂区域而不是弹一个小窗：做题需要看题干，小窗会让人反复滚动。 */
+
+.quiz {
+  position: fixed;
+  inset: var(--topbar-h) 0 0 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 24px 22px;
+  overflow-y: auto;
+  background: var(--bg-app);
+}
+
+/* display:flex 会盖掉 `[hidden]` 的默认样式，必须显式处理 */
+.quiz[hidden] { display: none; }
+
+.quiz-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-shrink: 0;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.quiz-head button { margin-left: auto; font-size: 12px; }
+
+.quiz-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+  flex-shrink: 0;
+}
+
+.quiz-row input[type="number"] { width: 72px; }
+.quiz-types label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+
+.quiz-hint { font-size: 12px; color: var(--text-muted); }
+
+.quiz-body,
+.quiz-result {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.quiz-item {
+  padding: 14px 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.quiz-stem { margin-bottom: 8px; font-size: 15px; line-height: 1.6; }
+.quiz-options { display: flex; flex-direction: column; gap: 6px; }
+
+.quiz-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.quiz-fill {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+}
+
+.quiz-loading { display: flex; justify-content: center; padding: 40px; }
+
+.quiz-score { display: flex; align-items: baseline; gap: 10px; }
+.quiz-score strong { font-size: 32px; }
+
+.quiz-review { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+
+.quiz-review-item {
+  padding: 10px 12px;
+  background: var(--bg-surface);
+  border-left: 3px solid var(--ok);
+  border-radius: var(--radius-md);
+}
+
+.quiz-review-item.bad { border-left-color: var(--err); }
+.quiz-review-head { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.quiz-mark { font-weight: 700; }
+.quiz-review-body { margin-top: 4px; font-size: 13px; color: var(--text-secondary); }
+.quiz-explain { margin-top: 4px; color: var(--text-primary); }
+
+/* ---------------------------------------------------- 小测面板（改版）
+   两个问题一起修：
+
+   ① **可见性**：`.quiz-row` / `.quiz-body` 用了 `display:flex`，它会盖掉
+      浏览器对 `[hidden]` 的默认 `display:none`——于是"交卷"和"再出一份"
+      会同时出现在屏幕上（截图里就是）。这里统一兜住。
+   ② **观感**：原来所有东西挤在左侧一条里。现在按整站风格做成一张居中的
+      卡片：分段题数、可点选的题型胶囊、选项整行可点（选中时描边高亮）、
+      结果页用大分数 + 逐题卡片。 */
+
+.quiz[hidden],
+.quiz-row[hidden],
+.quiz-body[hidden],
+.quiz-result[hidden],
+.quiz-setup[hidden],
+.quiz-loading[hidden] { display: none; }
+
+.quiz {
+  padding: 26px 24px 40px;
+  background: var(--bg-app);
+}
+
+.quiz-head {
+  align-items: center;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.quiz-head strong { font-size: 16px; }
+
+.quiz-setup,
+.quiz-body,
+.quiz-result,
+.quiz-row {
+  max-width: 780px;
+}
+
+.quiz-setup {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 22px 24px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+
+.quiz-row { gap: 10px; }
+.quiz-row > label { font-size: 13px; color: var(--text-secondary); }
+
+/* 题数：数字框加一点分量，看起来是"要填的东西"而不是浮在页面上的小格子 */
+.quiz-row input[type="number"] {
+  width: 76px;
+  padding: 7px 10px;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+}
+
+/* 题型：整块可点，选中变强调色（`:has` 在 WebView2 的 Chromium 里可用） */
+.quiz-types { gap: 8px; }
+
+.quiz-types label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 14px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  user-select: none;
+}
+
+.quiz-types label:has(input:checked) {
+  color: var(--text-primary);
+  background: var(--accent-soft);
+  border-color: var(--border-focus);
+}
+
+.quiz-types input { accent-color: var(--accent); }
+
+/* 题目卡：编号在左上，题干与选项分行，选中整行高亮 */
+.quiz-item {
+  padding: 18px 20px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+
+.quiz-stem { font-size: 15px; line-height: 1.7; }
+
+.quiz-options { gap: 8px; margin-top: 10px; }
+
+.quiz-option {
+  padding: 9px 12px;
+  font-size: 14px;
+  line-height: 1.6;
+  background: var(--bg-app);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  transition: border-color .12s ease, background .12s ease;
+}
+
+.quiz-option:hover { border-color: var(--border-strong); }
+
+.quiz-option:has(input:checked) {
+  background: var(--accent-soft);
+  border-color: var(--border-focus);
+}
+
+.quiz-option input { margin-top: 3px; accent-color: var(--accent); }
+.quiz-option span { flex: 1 1 auto; }
+
+.quiz-fill { padding: 9px 12px; font-size: 15px; border-radius: var(--radius-md); }
+
+/* 生成中：一根不确定进度的横条 + 已等秒数（慢的时候人要知道还在动） */
+.quiz-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 46px 0;
+  color: var(--text-secondary);
+}
+
+.quiz-loading-text { font-size: 13px; font-variant-numeric: tabular-nums; }
+
+.quiz-bar {
+  width: 220px;
+  height: 3px;
+  overflow: hidden;
+  background: var(--border-subtle);
+  border-radius: var(--radius-full);
+}
+
+.quiz-bar i {
+  display: block;
+  width: 40%;
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--radius-full);
+  animation: quiz-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes quiz-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+
+/* 结果页：分数给足分量，逐题卡片左边缘用对错颜色区分 */
+.quiz-score {
+  align-items: baseline;
+  gap: 12px;
+  padding: 18px 22px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+}
+
+.quiz-score strong { font-size: 40px; line-height: 1; font-variant-numeric: tabular-nums; }
+
+.quiz-review-item { padding: 14px 16px; border-left-width: 3px; }
+.quiz-review-head { gap: 10px; }
+.quiz-mark { font-size: 15px; }
+.quiz-review-body { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
+
+/* 让三块内容都居中（上面只设了 max-width，没有 margin:auto 就会贴在左边） */
+.quiz-setup,
+.quiz-body,
+.quiz-result,
+.quiz-head {
+  max-width: 780px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* 进度尺"讲到过"里的步数徽标（如"第 2/5 步"）
+   用途：没有学生反馈、一路「继续讲」时，回看列表要能看出那个点讲到哪儿了。
+   注意 `.rail-index button` 是 `display:block`，`margin-left:auto` 在这里不生效；
+   跟着标题走一行反而更像注记。 */
+.rail-step {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* 一步被切成多页时的那条提示（课堂页）：可点，点了回到本步第一页。 */
+.slide-hint {
+  flex-shrink: 0;
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
+  background: var(--accent-soft);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+}
+
+/* 停滞提醒：比"本步共 N 页"更醒目（用警示色），因为它意味着出了问题。 */
+.slide-stall {
+  color: var(--text-primary);
+  background: var(--accent-soft);
+  border: 1px solid var(--warn);
+}
+
+/* ---------------------------------------------------------------- 首次使用 */
+/*
+ * 两块：首页的提示条、设置页的引导卡。
+ * 只用 design token，不写死颜色——测试会检查这一点（tests/test_design_tokens.py）。
+ */
+.first-run-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+}
+
+.first-run-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.first-run-banner-text strong { color: var(--text-primary); }
+.first-run-banner-text span { color: var(--text-secondary); font-size: 0.92em; }
+
+.first-run {
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+  background: var(--bg-surface);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+
+.first-run h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 1.05em;
+  color: var(--text-primary);
+}
+
+.first-run-steps {
+  margin: 0 0 var(--space-2);
+  padding-left: 1.4em;
+  color: var(--text-secondary);
+  line-height: 1.9;
+}
+
+.first-run-steps code,
+.first-run code { color: var(--text-primary); }
+
+.first-run a { color: var(--accent); }
+
+.hint-ok { color: var(--ok); }
+.hint-err { color: var(--err); }

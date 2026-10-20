@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}课堂 · CREW{% endblock %}
+
+{% block head_extra %}
+  <!-- 公式渲染（KaTeX）。本地文件，离线可用；缺失时 latex.js 自动回退 CDN。
+       课堂比对话页更依赖公式，所以同样提前加载。 -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}">
+  <script defer src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}"></script>
+{% endblock %}
+
+{% block body %}
+<!-- 课堂：课程下的第二级页面。
+     **不复用课程页的骨架**——那边的 `.workbench` 是 `296px 1fr` 的两列栅格，
+     把左栏藏起来并不会收回那一列，卡片会被压成一条（这是第一版的真实故障）。
+     这里是一个单列、占满视口的舞台：上面一条细工具栏，中间是"一页"，
+     下面是翻页/继续，最下面是"这一步讲完了"的反馈框。 -->
+<div class="classroom" id="classroom">
+  <header class="classroom-bar">
+    <a class="back-link" id="back-to-chat" href="/course/{{ course_id }}">← 回到对话</a>
+    <span class="classroom-point" id="cl-point">正在打开课程…</span>
+    <span class="classroom-pos" id="cl-pos">—</span>
+    <span class="classroom-spacer"></span>
+    <button type="button" id="cl-quiz">小测</button>
+    <button type="button" id="cl-full" title="全屏（F）">全屏</button>
+  </header>
+
+  <main class="classroom-stage">
+    <article class="slide" id="cl-card">
+      <div class="slide-empty">正在打开课程…</div>
+    </article>
+
+    <!-- 一步被切成多页时的提示（"本步共 3 页 · 从第 1 页看起"）。
+         生成完会自动翻到**最新一页**，但一步可能有好几页——
+         这条提示保证"你不会因为自动翻页而漏读前面那两页"。 -->
+    <div class="slide-hint" id="cl-hint" hidden></div>
+
+    <!-- 停滞提醒：连接还在、但很久没有新内容（真实发生过：一直停在"讲课中"）。
+         不只提示，还给一个中止入口——不能让人只能干等。 -->
+    <div class="slide-hint slide-stall" id="cl-stall" hidden></div>
+
+    <!-- 页点：一页一点。课堂没有左栏，学生要知道"还剩多少、走到哪儿"只能看它。 -->
+    <div class="slide-dots" id="cl-dots"></div>
+
+    <div class="slide-foot">
+      <button type="button" id="cl-prev">← 上一页</button>
+      <button type="button" id="cl-next">下一页 →</button>
+      <button type="button" id="cl-skip">跳过本页</button>
+      <button type="button" class="primary" id="cl-gen">继续讲</button>
+    </div>
+  </main>
+
+  <!-- 一步讲完后自动弹出：先让讲师讲完这一步，再问学生的反馈。
+       这个顺序是有意的——"讲一段就问一句"会把讲授切得很碎，
+       而"这一步讲完再收反馈"才像一个完整的教学单元。 -->
+  <section class="step-ask" id="cl-ask" hidden>
+    <div class="step-ask-head">
+      <strong>这一步讲完了</strong>
+      <span class="step-ask-sub" id="cl-ask-sub">听懂了吗？哪里还不清楚？</span>
+    </div>
+    <div class="step-ask-body">
+      <textarea id="cl-input" rows="2"
+                placeholder="比如：听懂了 / 这里没懂 / 举个例子（回车发送）"></textarea>
+      <button type="button" class="primary" id="cl-send">发送并继续</button>
+    </div>
+    <div class="step-ask-hint" id="cl-ask-hint"></div>
+  </section>
+
+  <!-- 小测：课堂里的第三个状态（讲授 → 反馈 → 小测）。
+       为什么放在同一个页面而不是另开一页：讲完就在这儿考，考完还能翻回去看那一页；
+       跳走再跳回来，人容易断线。 -->
+  <section class="quiz" id="cl-quiz-panel" hidden>
+    <header class="quiz-head">
+      <strong id="qz-title">小测</strong>
+      <span class="quiz-hint" id="qz-hint"></span>
+      <button type="button" id="qz-close">关闭</button>
+    </header>
+
+    <!-- ① 设置：题数与题型都由学生定 -->
+    <div class="quiz-setup" id="qz-setup">
+      <!-- 上次出的题还没做：放在最上面，点了直接接着做（也省一次出题的钱） -->
+      <div class="quiz-row" id="qz-open-hint" hidden>
+        <span class="quiz-hint"></span>
+        <button type="button" id="qz-resume">接着做</button>
+      </div>
+
+      <div class="quiz-row">
+        <label for="qz-count">题数</label>
+        <input type="number" id="qz-count" min="3" max="10" value="5">
+        <span class="quiz-hint">3–10 题，默认 5</span>
+      </div>
+      <div class="quiz-row quiz-types" id="qz-types">
+        <label><input type="checkbox" value="single_choice" checked> 单选题</label>
+        <label><input type="checkbox" value="multi_choice" checked> 多选题</label>
+        <label><input type="checkbox" value="fill" checked> 填空题</label>
+        <label><input type="checkbox" value="judge" checked> 判断题</label>
+      </div>
+      <div class="quiz-row">
+        <button type="button" class="primary" id="qz-start">开始出题</button>
+        <button type="button" id="qz-skip">跳过测试</button>
+      </div>
+      <p class="quiz-hint">跳过测试不会记成绩，也不算"通过"——它只是一条"未测"。</p>
+    </div>
+
+    <!-- ② 作答 -->
+    <div class="quiz-body" id="qz-body" hidden></div>
+    <div class="quiz-row" id="qz-submit-row" hidden>
+      <button type="button" class="primary" id="qz-submit">交卷</button>
+      <button type="button" id="qz-skip-2">跳过测试</button>
+    </div>
+
+    <!-- ③ 判分结果 -->
+    <div class="quiz-result" id="qz-result" hidden></div>
+    <div class="quiz-row" id="qz-result-row" hidden>
+      <button type="button" id="qz-export">导出 Word</button>
+      <button type="button" id="qz-again">再出一份</button>
+      <button type="button" class="primary" id="qz-back">回到课堂</button>
+    </div>
+  </section>
+</div>
+{% endblock %}

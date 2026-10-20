@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}讲义 · CREW{% endblock %}
+
+{% block head_extra %}
+<!-- 公式渲染（KaTeX）：讲义正文里全是公式，所以这一页和课程页一样需要它。
+     走**本地** vendor 文件，离线可用；缺了它会退到 CDN，而"拷给别人也能用"
+     正是这个项目的承诺。
+     为什么不是所有页面都引：它 300KB 上下，工作台与新建课程一页公式都没有。 -->
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}">
+<script defer src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}"></script>
+{% endblock %}
+
+{% block body %}
+<main class="page">
+
+  <div class="section-head">
+    <div>
+      <h1>讲义</h1>
+      <p class="faint">
+        每轮授课都会自动落盘，一章一个文件。<strong>文件本来就在你的工作区里</strong>——
+        这一页只把它们列出来、让你在应用里直接读，不在这里做任何修改。
+      </p>
+    </div>
+    <span class="badge" id="notes-total">读取中…</span>
+  </div>
+
+  <div class="notes-layout">
+    <aside class="notes-list" id="notes-list" aria-label="讲义文件">
+      <p class="faint">读取中…</p>
+    </aside>
+
+    <section class="notes-view" id="notes-view" aria-label="讲义内容">
+      <p class="faint">左边选一份讲义，这里显示内容。</p>
+    </section>
+  </div>
+
+</main>
+{% endblock %}

@@ -1,0 +1,3109 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass, field
+import json
+import logging
+import os
+import re
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, TypedDict
+from urllib.parse import urlsplit
+
+import httpx
+from openai import (
+    APIConnectionError,
+    APIResponseValidationError,
+    APIStatusError,
+    AsyncOpenAI,
+    AuthenticationError,
+    BadRequestError,
+    ConflictError,
+    InternalServerError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+    Stream,
+    UnprocessableEntityError,
+)
+from openai.lib.streaming.chat import ChatCompletionStream
+from openai.types.chat import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionMessageFunctionToolCall,
+)
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from openai.types.responses import (
+    Response,
+    ResponseCodeInterpreterToolCall,
+    ResponseComputerToolCall,
+    ResponseFileSearchToolCall,
+    ResponseFunctionToolCall,
+    ResponseFunctionWebSearch,
+    ResponseReasoningItem,
+)
+from pydantic import BaseModel, PrivateAttr, model_validator
+
+from crewai.events.types.llm_events import LLMCallType
+from crewai.hooks.dispatch import HookAborted
+from crewai.llms._finish_reason_utils import extract_choices_finish_reason_and_id
+from crewai.llms.base_llm import (
+    BaseLLM,
+    JsonResponseFormat,
+    LLMCallBlockedError,
+    llm_call_context,
+)
+from crewai.llms.hooks.base import BaseInterceptor
+from crewai.llms.hooks.transport import AsyncHTTPTransport, HTTPTransport
+from crewai.llms.providers.utils.common import safe_tool_conversion
+from crewai.utilities.agent_utils import is_context_length_exceeded
+from crewai.utilities.exceptions.context_window_exceeding_exception import (
+    LLMContextLengthExceededError,
+)
+from crewai.utilities.pydantic_schema_utils import (
+    generate_model_description,
+    sanitize_tool_params_for_openai_strict,
+)
+from crewai.utilities.types import LLMMessage
+
+
+if TYPE_CHECKING:
+    from crewai.agents.agent_builder.base_agent import BaseAgent
+    from crewai.task import Task
+    from crewai.tools.base_tool import BaseTool
+
+
+# Models learned at runtime to be unavailable on /v1/chat/completions, keyed by
+# the model string as configured. Populated from the 404 by
+# `_remember_responses_only_model` so the wasted round trip is paid once per model
+# per process rather than on every call.
+_LEARNED_RESPONSES_ONLY_MODELS: set[str] = set()
+
+# (endpoint, model) pairs a 400 has shown to reject `reasoning_effort` in this
+# process, so the rejected call is paid once rather than on every request. Keyed
+# by endpoint as well as name because the same name on a gateway and on OpenAI
+# itself are different models, and one must not silence the other.
+_LEARNED_NO_REASONING_EFFORT_MODELS: set[tuple[str, str]] = set()
+
+# Upstream status codes carried inside a 200 body, mapped to the exception the SDK
+# raises when the same code arrives as a real HTTP status. Keeping the classes
+# identical means a gateway-masked failure is catchable by whatever already handles
+# the honest one. Codes outside this table fall back to `InternalServerError` for
+# 5xx, otherwise `APIStatusError`.
+_UPSTREAM_STATUS_ERRORS: Final[dict[int, type[APIStatusError]]] = {
+    400: BadRequestError,
+    401: AuthenticationError,
+    403: PermissionDeniedError,
+    404: NotFoundError,
+    409: ConflictError,
+    422: UnprocessableEntityError,
+    429: RateLimitError,
+}
+
+
+def _upstream_status_code(error: Mapping[str, Any]) -> int | None:
+    """Read an HTTP-like status code out of a gateway error object.
+
+    OpenAI-style bodies put a slug in `code` ("model_not_found"), gateways put the
+    upstream status there instead; only the latter is a status code.
+    """
+    code = error.get("code")
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, int):
+        return code if 400 <= code <= 599 else None
+    if isinstance(code, str) and code.isdigit():
+        parsed = int(code)
+        return parsed if 400 <= parsed <= 599 else None
+    return None
+
+
+def _raise_for_upstream_error(
+    body: str,
+    *,
+    model: str,
+    http_response: httpx.Response,
+) -> None:
+    """Raise when a 200 response carries an upstream error instead of choices.
+
+    Gateways commit `200 OK` as soon as a provider accepts the request, so a later
+    provider failure is reported in the body -- an `error` object and no `choices`.
+    The OpenAI SDK guards this for streams (`openai/_streaming.py`) but not for
+    non-streaming responses, where the absent `choices` surfaces from inside the
+    parse helper as `TypeError: 'NoneType' object is not iterable`, naming neither
+    the provider nor the status.
+    """
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        # Not JSON, so not an error envelope. A non-JSON 200 already has its own
+        # (pre-existing) handling in the SDK, which returns the body as `str`.
+        return
+
+    if not isinstance(payload, Mapping) or payload.get("choices"):
+        return
+
+    host = http_response.request.url.host
+    error = payload.get("error")
+
+    if not isinstance(error, Mapping):
+        raise APIResponseValidationError(
+            response=http_response,
+            body=payload,
+            message=(
+                f"{model} via {host} returned HTTP 200 with no choices and no error "
+                f"object; the response does not describe a completion"
+            ),
+        )
+
+    detail = error.get("message") or "no message given"
+    code = _upstream_status_code(error)
+    suffix = f" (upstream code {code})" if code is not None else ""
+    message = (
+        f"{model} via {host} returned HTTP 200 with an upstream error and no "
+        f"choices: {detail}{suffix}"
+    )
+
+    if code is None:
+        raise APIResponseValidationError(
+            response=http_response, body=error, message=message
+        )
+
+    error_cls = _UPSTREAM_STATUS_ERRORS.get(code) or (
+        InternalServerError if code >= 500 else APIStatusError
+    )
+    raise error_cls(message, response=http_response, body=error)
+
+
+# `reasoning_effort` is accepted by the o-series and by GPT generation 5 onwards.
+# Matched by shape rather than by a list of names so a new member of an existing
+# family works without a release here; `gpt-4o` and `gpt-4.1` parse to generation
+# 4 and are excluded, and a fine-tune is judged by its base model. An over-match
+# is recovered rather than fatal -- the call is retried without the parameter
+# when the API rejects it.
+_O_SERIES_MODEL: Final = re.compile(r"^o\d")
+_GPT_GENERATION: Final = re.compile(r"^gpt-(\d+)")
+_MIN_REASONING_GPT_GENERATION: Final[int] = 5
+# ft:<base model>:<org>:<suffix>:<id>
+_FINE_TUNE_PREFIX: Final = "ft:"
+_OPENAI_API_HOST: Final = "api.openai.com"
+# How servers say a request field is not one they know: OpenAI's own two shapes
+# alongside the wordings of compatible servers (pydantic, serde, Go). A 400 that
+# names the parameter without one of these -- a bad value, the tools case -- is
+# not a rejection of the parameter and must surface.
+_UNKNOWN_PARAMETER_PHRASES: Final = (
+    "unsupported parameter",
+    "unrecognized request argument",
+    "unknown field",
+    "unknown parameter",
+    "unknown argument",
+    "unexpected field",
+    "unexpected parameter",
+    "extra inputs",
+    "not permitted",
+    "additional properties",
+)
+
+
+def _supports_reasoning_effort(model: str) -> bool:
+    """Whether the model accepts `reasoning_effort` on /v1/chat/completions."""
+    name = model.rsplit("/", 1)[-1].lower().removeprefix(_FINE_TUNE_PREFIX)
+    if _O_SERIES_MODEL.match(name):
+        return True
+    generation = _GPT_GENERATION.match(name)
+    return (
+        generation is not None
+        and int(generation.group(1)) >= _MIN_REASONING_GPT_GENERATION
+    )
+
+
+class WebSearchResult(TypedDict, total=False):
+    """Result from web search built-in tool."""
+
+    id: str | None
+    status: str | None
+    type: str
+
+
+class FileSearchResultItem(TypedDict, total=False):
+    """Individual file search result."""
+
+    file_id: str | None
+    filename: str | None
+    text: str | None
+    score: float | None
+    attributes: dict[str, str | float | bool] | None
+
+
+class FileSearchResult(TypedDict, total=False):
+    """Result from file search built-in tool."""
+
+    id: str | None
+    status: str | None
+    type: str
+    queries: list[str]
+    results: list[FileSearchResultItem]
+
+
+class CodeInterpreterLogResult(TypedDict):
+    """Log output from code interpreter."""
+
+    type: str
+    logs: str
+
+
+class CodeInterpreterFileResult(TypedDict):
+    """File output from code interpreter."""
+
+    type: str
+    files: list[dict[str, Any]]
+
+
+class CodeInterpreterResult(TypedDict, total=False):
+    """Result from code interpreter built-in tool."""
+
+    id: str | None
+    status: str | None
+    type: str
+    code: str | None
+    container_id: str | None
+    results: list[CodeInterpreterLogResult | CodeInterpreterFileResult]
+
+
+class ComputerUseResult(TypedDict, total=False):
+    """Result from computer use built-in tool."""
+
+    id: str | None
+    status: str | None
+    type: str
+    call_id: str | None
+    action: dict[str, Any]
+    pending_safety_checks: list[dict[str, Any]]
+
+
+class ReasoningSummary(TypedDict, total=False):
+    """Summary from model reasoning."""
+
+    id: str | None
+    status: str | None
+    type: str
+    summary: list[dict[str, Any]]
+    encrypted_content: str | None
+
+
+@dataclass
+class ResponsesAPIResult:
+    """Result from OpenAI Responses API including text and tool outputs.
+
+    Attributes:
+        text: The text content from the response.
+        web_search_results: Results from web_search built-in tool calls.
+        file_search_results: Results from file_search built-in tool calls.
+        code_interpreter_results: Results from code_interpreter built-in tool calls.
+        computer_use_results: Results from computer_use built-in tool calls.
+        reasoning_summaries: Reasoning/thinking summaries from the model.
+        function_calls: Custom function tool calls.
+        response_id: The response ID for multi-turn conversations.
+    """
+
+    text: str = ""
+    web_search_results: list[WebSearchResult] = field(default_factory=list)
+    file_search_results: list[FileSearchResult] = field(default_factory=list)
+    code_interpreter_results: list[CodeInterpreterResult] = field(default_factory=list)
+    computer_use_results: list[ComputerUseResult] = field(default_factory=list)
+    reasoning_summaries: list[ReasoningSummary] = field(default_factory=list)
+    function_calls: list[dict[str, Any]] = field(default_factory=list)
+    response_id: str | None = None
+
+    def has_tool_outputs(self) -> bool:
+        """Check if there are any built-in tool outputs."""
+        return bool(
+            self.web_search_results
+            or self.file_search_results
+            or self.code_interpreter_results
+            or self.computer_use_results
+        )
+
+    def has_reasoning(self) -> bool:
+        """Check if there are reasoning summaries."""
+        return bool(self.reasoning_summaries)
+
+
+class OpenAICompletion(BaseLLM):
+    """OpenAI native completion implementation.
+
+    This class provides direct integration with the OpenAI Python SDK,
+    supporting both Chat Completions API and Responses API.
+
+    The Responses API is OpenAI's newer API primitive with built-in tools
+    (web search, file search, code interpreter), stateful conversations,
+    and improved reasoning model support.
+
+    Args:
+        api: Which OpenAI API to use - "completions" (default) or "responses".
+        instructions: System-level instructions (Responses API only).
+        store: Whether to store responses for multi-turn (Responses API only).
+        previous_response_id: ID of previous response for multi-turn (Responses API only).
+        include: Additional data to include in response (Responses API only).
+        builtin_tools: List of OpenAI built-in tools to enable (Responses API only).
+            Supported: "web_search", "file_search", "code_interpreter", "computer_use".
+        parse_tool_outputs: Whether to return structured ResponsesAPIResult with
+            parsed built-in tool outputs instead of just text (Responses API only).
+        auto_chain: Automatically track and use response IDs for multi-turn
+            conversations (Responses API only). When True, each response ID is saved
+            and used as previous_response_id in subsequent calls.
+        auto_chain_reasoning: Automatically track and pass encrypted reasoning items
+            for ZDR (Zero Data Retention) compliance (Responses API only). When True,
+            adds "reasoning.encrypted_content" to include, captures reasoning items
+            from responses, and passes them back in subsequent calls to preserve
+            chain-of-thought without storing data on OpenAI servers.
+    """
+
+    llm_type: Literal["openai"] = "openai"
+
+    BUILTIN_TOOL_TYPES: ClassVar[dict[str, str]] = {
+        "web_search": "web_search_preview",
+        "file_search": "file_search",
+        "code_interpreter": "code_interpreter",
+        "computer_use": "computer_use_preview",
+    }
+
+    model: str = "gpt-4o"
+    organization: str | None = None
+    project: str | None = None
+    timeout: float | None = None
+    max_retries: int = 2
+    default_headers: dict[str, str] | None = None
+    default_query: dict[str, Any] | None = None
+    client_params: dict[str, Any] | None = None
+    top_p: float | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    seed: int | None = None
+    stream: bool = False
+    response_format: JsonResponseFormat | type[BaseModel] | None = None
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
+    reasoning_effort: str | None = None
+    interceptor: BaseInterceptor[httpx.Request, httpx.Response] | None = None
+    api: Literal["completions", "responses"] = "completions"
+    instructions: str | None = None
+    store: bool | None = None
+    previous_response_id: str | None = None
+    include: list[str] | None = None
+    builtin_tools: list[str] | None = None
+    parse_tool_outputs: bool = False
+    auto_chain: bool = False
+    auto_chain_reasoning: bool = False
+    api_base: str | None = None
+    custom_openai: bool = False
+    is_o1_model: bool = False
+    is_gpt4_model: bool = False
+
+    _client: Any = PrivateAttr(default=None)
+    _async_client: Any = PrivateAttr(default=None)
+    _last_response_id: str | None = PrivateAttr(default=None)
+    _last_reasoning_items: list[Any] | None = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_openai_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if data.get("custom_openai"):
+            custom_base_url = (
+                data.get("base_url")
+                or data.get("api_base")
+                or os.getenv("OPENAI_BASE_URL")
+                or os.getenv("OPENAI_API_BASE")
+            )
+            if not custom_base_url:
+                raise ValueError(
+                    "custom_openai=True requires base_url, api_base, "
+                    "OPENAI_BASE_URL, or OPENAI_API_BASE"
+                )
+            if not data.get("base_url") and not data.get("api_base"):
+                data["base_url"] = custom_base_url
+        if not data.get("provider"):
+            data["provider"] = "openai"
+        data["api_key"] = data.get("api_key") or os.getenv("OPENAI_API_KEY")
+        if "api_base" not in data:
+            data["api_base"] = None
+        model = data.get("model", "gpt-4o")
+        data["is_o1_model"] = "o1" in model.lower()
+        data["is_gpt4_model"] = "gpt-4" in model.lower()
+        return data
+
+    @model_validator(mode="after")
+    def _init_clients(self) -> OpenAICompletion:
+        """Eagerly build clients when the API key is available, otherwise
+        defer so ``LLM(model="openai/...")`` can be constructed at module
+        import time even before deployment env vars are set.
+        """
+        try:
+            self._client = self._build_sync_client()
+            self._async_client = self._build_async_client()
+        except ValueError:
+            pass
+        return self
+
+    def _build_sync_client(self) -> Any:
+        client_config = self._get_client_params()
+        if self.interceptor:
+            transport = HTTPTransport(interceptor=self.interceptor)
+            client_config["http_client"] = httpx.Client(transport=transport)
+        return OpenAI(**client_config)
+
+    def _build_async_client(self) -> Any:
+        client_config = self._get_client_params()
+        if self.interceptor:
+            transport = AsyncHTTPTransport(interceptor=self.interceptor)
+            client_config["http_client"] = httpx.AsyncClient(transport=transport)
+        return AsyncOpenAI(**client_config)
+
+    def _get_sync_client(self) -> Any:
+        if self._client is None:
+            self._client = self._build_sync_client()
+        return self._client
+
+    def _get_async_client(self) -> Any:
+        if self._async_client is None:
+            self._async_client = self._build_async_client()
+        return self._async_client
+
+    @property
+    def last_response_id(self) -> str | None:
+        """Get the last response ID from auto-chaining.
+
+        Returns:
+            The response ID from the most recent Responses API call,
+            or None if no calls have been made or auto_chain is disabled.
+        """
+        return self._last_response_id
+
+    def reset_chain(self) -> None:
+        """Reset the auto-chain state to start a new conversation.
+
+        Clears the stored response ID so the next call starts fresh
+        without linking to previous responses.
+        """
+        self._last_response_id = None
+
+    @property
+    def last_reasoning_items(self) -> list[Any] | None:
+        """Get the last reasoning items from auto-chain reasoning.
+
+        Returns:
+            The reasoning items from the most recent Responses API call
+            containing encrypted content, or None if no calls have been made
+            or auto_chain_reasoning is disabled.
+        """
+        return self._last_reasoning_items
+
+    def reset_reasoning_chain(self) -> None:
+        """Reset the reasoning chain state to start fresh.
+
+        Clears the stored reasoning items so the next call starts without
+        preserving previous chain-of-thought context. Useful when starting
+        a new reasoning task that shouldn't reference previous reasoning.
+        """
+        self._last_reasoning_items = None
+
+    def to_config_dict(self) -> dict[str, Any]:
+        """Extend base config with OpenAI-specific fields."""
+        config = super().to_config_dict()
+        if self.organization:
+            config["organization"] = self.organization
+        if self.project:
+            config["project"] = self.project
+        if self.timeout is not None:
+            config["timeout"] = self.timeout
+        if self.max_retries != 2:
+            config["max_retries"] = self.max_retries
+        if self.top_p is not None:
+            config["top_p"] = self.top_p
+        if self.frequency_penalty is not None:
+            config["frequency_penalty"] = self.frequency_penalty
+        if self.presence_penalty is not None:
+            config["presence_penalty"] = self.presence_penalty
+        if self.max_tokens is not None:
+            config["max_tokens"] = self.max_tokens
+        if self.max_completion_tokens is not None:
+            config["max_completion_tokens"] = self.max_completion_tokens
+        if self.seed is not None:
+            config["seed"] = self.seed
+        if self.reasoning_effort is not None:
+            config["reasoning_effort"] = self.reasoning_effort
+        if self.custom_openai:
+            config["model"] = self.model
+            config["custom_openai"] = True
+            config["base_url"] = (
+                self.base_url
+                or self.api_base
+                or os.getenv("OPENAI_BASE_URL")
+                or os.getenv("OPENAI_API_BASE")
+            )
+        return config
+
+    def _get_client_params(self) -> dict[str, Any]:
+        """Get OpenAI client parameters."""
+
+        if self.api_key is None:
+            self.api_key = os.getenv("OPENAI_API_KEY")
+            if self.api_key is None:
+                raise ValueError("OPENAI_API_KEY is required")
+
+        base_params = {
+            "api_key": self.api_key,
+            "organization": self.organization,
+            "project": self.project,
+            "base_url": self.base_url
+            or self.api_base
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("OPENAI_API_BASE")
+            or None,
+            "timeout": self.timeout,
+            "max_retries": self.max_retries,
+            "default_headers": self.default_headers,
+            "default_query": self.default_query,
+        }
+
+        client_params = {k: v for k, v in base_params.items() if v is not None}
+
+        if self.client_params:
+            client_params.update(self.client_params)
+
+        return client_params
+
+    def call(
+        self,
+        messages: str | list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        callbacks: list[Any] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Call OpenAI API (Chat Completions or Responses based on api setting).
+
+        Args:
+            messages: Input messages for the completion.
+            tools: List of tool/function definitions.
+            callbacks: Callback functions (not used in native implementation).
+            available_functions: Available functions for tool calling.
+            from_task: Task that initiated the call.
+            from_agent: Agent that initiated the call.
+            response_model: Response model for structured output.
+
+        Returns:
+            Completion response or tool call result.
+        """
+        with llm_call_context():
+            try:
+                self._emit_call_started_event(
+                    messages=messages,
+                    tools=tools,
+                    callbacks=callbacks,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                )
+
+                formatted_messages = self._format_messages(messages)
+
+                self._invoke_before_llm_call_hooks(formatted_messages, from_agent)
+
+                if self._effective_api() == "responses":
+                    return self._call_responses(
+                        messages=formatted_messages,
+                        tools=tools,
+                        available_functions=available_functions,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        response_model=response_model,
+                    )
+
+                return self._call_completions(
+                    messages=formatted_messages,
+                    tools=tools,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_model=response_model,
+                )
+
+            except (HookAborted, LLMCallBlockedError) as e:
+                self._emit_call_denied_event(e, from_task, from_agent)
+                raise
+            except Exception as e:
+                error_msg = f"OpenAI API call failed: {e!s}"
+                logging.error(error_msg)
+                self._emit_call_failed_event(
+                    error=error_msg, from_task=from_task, from_agent=from_agent
+                )
+                raise
+
+    def _call_completions(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Call OpenAI Chat Completions API.
+
+        Falls back to the Responses API when the model turns out not to be served
+        by chat completions, which OpenAI reports as a 404 distinct from a genuine
+        unknown model.
+        """
+        completion_params = self._prepare_completion_params(
+            messages=messages, tools=tools
+        )
+
+        def dispatch(params: dict[str, Any]) -> str | Any:
+            if self._effective_stream():
+                return self._handle_streaming_completion(
+                    params=params,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_model=response_model,
+                )
+            return self._handle_completion(
+                params=params,
+                available_functions=available_functions,
+                from_task=from_task,
+                from_agent=from_agent,
+                response_model=response_model,
+            )
+
+        try:
+            return dispatch(completion_params)
+        except Exception as e:
+            cause = e.__cause__ or e
+
+            if self._rejects_reasoning_effort_with_tools(cause):
+                retry_params = self._reasoning_effort_none_params(completion_params)
+                if retry_params is not None:
+                    logging.debug(
+                        'Retrying %r with reasoning_effort="none": function tools '
+                        "and reasoning effort cannot be combined on "
+                        '/v1/chat/completions. Use api="responses" to keep both.',
+                        self.model,
+                    )
+                    return dispatch(retry_params)
+
+            if self._rejects_reasoning_effort_as_unsupported(cause):
+                retry_params = self._without_reasoning_effort(completion_params)
+                if retry_params is not None:
+                    result = dispatch(retry_params)
+                    self._remember_no_reasoning_effort_model()
+                    return result
+
+            if self.custom_openai or not self._is_responses_only_error(cause):
+                raise
+            self._remember_responses_only_model()
+            logging.debug(
+                "Retrying %r on the Responses API: not served by "
+                '/v1/chat/completions. Set api="responses" to skip this.',
+                self.model,
+            )
+            return self._call_responses(
+                messages=messages,
+                tools=tools,
+                available_functions=available_functions,
+                from_task=from_task,
+                from_agent=from_agent,
+                response_model=response_model,
+            )
+
+    async def acall(
+        self,
+        messages: str | list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        callbacks: list[Any] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Async call to OpenAI API (Chat Completions or Responses).
+
+        Args:
+            messages: Input messages for the completion.
+            tools: List of tool/function definitions.
+            callbacks: Callback functions (not used in native implementation).
+            available_functions: Available functions for tool calling.
+            from_task: Task that initiated the call.
+            from_agent: Agent that initiated the call.
+            response_model: Response model for structured output.
+
+        Returns:
+            Completion response or tool call result.
+        """
+        with llm_call_context():
+            try:
+                self._emit_call_started_event(
+                    messages=messages,
+                    tools=tools,
+                    callbacks=callbacks,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                )
+
+                formatted_messages = self._format_messages(messages)
+
+                self._invoke_before_llm_call_hooks(formatted_messages, from_agent)
+
+                if self._effective_api() == "responses":
+                    return await self._acall_responses(
+                        messages=formatted_messages,
+                        tools=tools,
+                        available_functions=available_functions,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        response_model=response_model,
+                    )
+
+                return await self._acall_completions(
+                    messages=formatted_messages,
+                    tools=tools,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_model=response_model,
+                )
+
+            except (HookAborted, LLMCallBlockedError) as e:
+                self._emit_call_denied_event(e, from_task, from_agent)
+                raise
+            except Exception as e:
+                error_msg = f"OpenAI API call failed: {e!s}"
+                logging.error(error_msg)
+                self._emit_call_failed_event(
+                    error=error_msg, from_task=from_task, from_agent=from_agent
+                )
+                raise
+
+    async def _acall_completions(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Async call to OpenAI Chat Completions API.
+
+        Falls back to the Responses API for models not served by chat completions,
+        mirroring :meth:`_call_completions`.
+        """
+        completion_params = self._prepare_completion_params(
+            messages=messages, tools=tools
+        )
+
+        async def dispatch(params: dict[str, Any]) -> str | Any:
+            if self._effective_stream():
+                return await self._ahandle_streaming_completion(
+                    params=params,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_model=response_model,
+                )
+            return await self._ahandle_completion(
+                params=params,
+                available_functions=available_functions,
+                from_task=from_task,
+                from_agent=from_agent,
+                response_model=response_model,
+            )
+
+        try:
+            return await dispatch(completion_params)
+        except Exception as e:
+            cause = e.__cause__ or e
+
+            if self._rejects_reasoning_effort_with_tools(cause):
+                retry_params = self._reasoning_effort_none_params(completion_params)
+                if retry_params is not None:
+                    return await dispatch(retry_params)
+
+            if self._rejects_reasoning_effort_as_unsupported(cause):
+                retry_params = self._without_reasoning_effort(completion_params)
+                if retry_params is not None:
+                    result = await dispatch(retry_params)
+                    self._remember_no_reasoning_effort_model()
+                    return result
+
+            if self.custom_openai or not self._is_responses_only_error(cause):
+                raise
+            self._remember_responses_only_model()
+            return await self._acall_responses(
+                messages=messages,
+                tools=tools,
+                available_functions=available_functions,
+                from_task=from_task,
+                from_agent=from_agent,
+                response_model=response_model,
+            )
+
+    def _call_responses(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Call OpenAI Responses API."""
+        params = self._prepare_responses_params(
+            messages=messages, tools=tools, response_model=response_model
+        )
+
+        if self._effective_stream():
+            return self._handle_streaming_responses(
+                params=params,
+                available_functions=available_functions,
+                from_task=from_task,
+                from_agent=from_agent,
+                response_model=response_model,
+            )
+
+        return self._handle_responses(
+            params=params,
+            available_functions=available_functions,
+            from_task=from_task,
+            from_agent=from_agent,
+            response_model=response_model,
+        )
+
+    async def _acall_responses(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Async call to OpenAI Responses API."""
+        params = self._prepare_responses_params(
+            messages=messages, tools=tools, response_model=response_model
+        )
+
+        if self._effective_stream():
+            return await self._ahandle_streaming_responses(
+                params=params,
+                available_functions=available_functions,
+                from_task=from_task,
+                from_agent=from_agent,
+                response_model=response_model,
+            )
+
+        return await self._ahandle_responses(
+            params=params,
+            available_functions=available_functions,
+            from_task=from_task,
+            from_agent=from_agent,
+            response_model=response_model,
+        )
+
+    @staticmethod
+    def _to_responses_input(message: LLMMessage) -> list[dict[str, Any] | LLMMessage]:
+        """Translate a chat-format message into Responses ``input`` items.
+
+        Tool calling is expressed differently by the two APIs. Chat Completions
+        uses an assistant message carrying ``tool_calls`` (with ``content: None``)
+        followed by ``role: "tool"`` results; the Responses API uses flat
+        ``function_call`` / ``function_call_output`` items keyed by ``call_id``.
+
+        Passing the chat shape straight through is rejected:
+
+            Invalid type for 'input[1].content': expected one of an array of
+            objects or string, but got null instead.
+
+        Anything without tool calls is already valid and passes through unchanged.
+        """
+        role = message.get("role")
+
+        if role == "assistant" and message.get("tool_calls"):
+            items: list[dict[str, Any] | LLMMessage] = []
+            content = message.get("content")
+            if content:
+                items.append({"role": "assistant", "content": content})
+            for call in message["tool_calls"]:
+                function = call.get("function", {})
+                args = function.get("arguments")
+                if args is None or args == "":
+                    args = "{}"
+                elif not isinstance(args, str):
+                    args = json.dumps(args)
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call.get("id", ""),
+                        "name": function.get("name", ""),
+                        "arguments": args,
+                    }
+                )
+            return items
+
+        if role == "tool":
+            return [
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id", ""),
+                    "output": str(message.get("content", "")),
+                }
+            ]
+
+        return [message]
+
+    def _prepare_responses_params(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> dict[str, Any]:
+        """Prepare parameters for OpenAI Responses API.
+
+        The Responses API uses a different structure than Chat Completions:
+        - `input` instead of `messages`
+        - `instructions` for system-level guidance (extracted from system messages)
+        - `text.format` instead of `response_format` for structured outputs
+        - Internally-tagged tool format (flat structure)
+        """
+        instructions: str | None = self.instructions
+        input_messages: list[dict[str, Any] | LLMMessage] = []
+
+        for message in messages:
+            if message.get("role") == "system":
+                content = message.get("content", "")
+                content_str = content if isinstance(content, str) else str(content)
+                if instructions:
+                    instructions = f"{instructions}\n\n{content_str}"
+                else:
+                    instructions = content_str
+            else:
+                input_messages.extend(self._to_responses_input(message))
+
+        # Prepend reasoning items for ZDR (zero-data-retention) chaining when configured
+        final_input: list[dict[str, Any] | LLMMessage] = []
+        if self.auto_chain_reasoning and self._last_reasoning_items:
+            final_input.extend(self._last_reasoning_items)
+        final_input.extend(input_messages if input_messages else messages)
+
+        params: dict[str, Any] = {
+            "model": self.model,
+            "input": final_input,
+        }
+
+        if instructions:
+            params["instructions"] = instructions
+
+        if self._effective_stream():
+            params["stream"] = True
+
+        if self.store is not None:
+            params["store"] = self.store
+
+        # Handle response chaining: explicit previous_response_id takes precedence
+        if self.previous_response_id:
+            params["previous_response_id"] = self.previous_response_id
+        elif self.auto_chain and self._last_response_id:
+            params["previous_response_id"] = self._last_response_id
+
+        include_items: list[str] = list(self.include) if self.include else []
+        if self.auto_chain_reasoning:
+            if "reasoning.encrypted_content" not in include_items:
+                include_items.append("reasoning.encrypted_content")
+        if include_items:
+            params["include"] = include_items
+
+        params.update(self.additional_params)
+
+        if self.temperature is not None:
+            params["temperature"] = self.temperature
+        if self.top_p is not None:
+            params["top_p"] = self.top_p
+        if self.max_completion_tokens is not None:
+            params["max_output_tokens"] = self.max_completion_tokens
+        elif self.max_tokens is not None:
+            params["max_output_tokens"] = self.max_tokens
+        if self.seed is not None:
+            params["seed"] = self.seed
+
+        if self.reasoning_effort:
+            params["reasoning"] = {"effort": self.reasoning_effort}
+
+        if response_model or self.response_format:
+            format_model = response_model or self.response_format
+            if isinstance(format_model, type) and issubclass(format_model, BaseModel):
+                schema_output = generate_model_description(format_model)
+                json_schema = schema_output.get("json_schema", {})
+                params["text"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": json_schema.get("name", format_model.__name__),
+                        "strict": json_schema.get("strict", True),
+                        "schema": json_schema.get("schema", {}),
+                    }
+                }
+            elif isinstance(format_model, dict):
+                params["text"] = {"format": format_model}
+
+        all_tools: list[dict[str, Any]] = []
+
+        if self.builtin_tools:
+            for tool_name in self.builtin_tools:
+                tool_type = self.BUILTIN_TOOL_TYPES.get(tool_name, tool_name)
+                all_tools.append({"type": tool_type})
+
+        if tools:
+            all_tools.extend(self._convert_tools_for_responses(tools))
+
+        if all_tools:
+            params["tools"] = all_tools
+
+        crewai_specific_params = {
+            "callbacks",
+            "available_functions",
+            "from_task",
+            "from_agent",
+            "provider",
+            "api_key",
+            "base_url",
+            "api_base",
+            "timeout",
+        }
+
+        return {k: v for k, v in params.items() if k not in crewai_specific_params}
+
+    def _convert_tools_for_responses(
+        self, tools: list[dict[str, BaseTool]]
+    ) -> list[dict[str, Any]]:
+        """Convert CrewAI tools to Responses API format.
+
+        Responses API uses internally-tagged format (flat structure):
+        {
+            "type": "function",
+            "name": "get_weather",
+            "description": "...",
+            "parameters": {...}
+        }
+
+        Unlike Chat Completions which uses externally-tagged:
+        {
+            "type": "function",
+            "function": {"name": "...", "description": "...", "parameters": {...}}
+        }
+        """
+        responses_tools = []
+
+        for tool in tools:
+            name, description, parameters = safe_tool_conversion(tool, "OpenAI")
+
+            responses_tool: dict[str, Any] = {
+                "type": "function",
+                "name": name,
+                "description": description,
+            }
+
+            if parameters:
+                if isinstance(parameters, dict):
+                    responses_tool["parameters"] = parameters
+                else:
+                    responses_tool["parameters"] = dict(parameters)
+
+            responses_tools.append(responses_tool)
+
+        return responses_tools
+
+    def _handle_responses(
+        self,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | ResponsesAPIResult | Any:
+        """Handle non-streaming Responses API call."""
+        try:
+            response: Response = self._get_sync_client().responses.create(**params)
+
+            if self.auto_chain and response.id:
+                self._last_response_id = response.id
+
+            if self.auto_chain_reasoning:
+                reasoning_items = self._extract_reasoning_items(response)
+                if reasoning_items:
+                    self._last_reasoning_items = reasoning_items
+
+            usage = self._extract_responses_token_usage(response)
+            self._track_token_usage_internal(usage)
+
+            finish_reason, response_id = self._extract_responses_finish_reason_and_id(
+                response
+            )
+
+            if self.parse_tool_outputs:
+                parsed_result = self._extract_builtin_tool_outputs(response)
+                parsed_result.text = self._apply_stop_words(parsed_result.text)
+
+                self._emit_call_completed_event(
+                    response=parsed_result.text,
+                    call_type=LLMCallType.LLM_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params.get("input", []),
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    response_id=response_id,
+                )
+
+                return parsed_result
+
+            function_calls = self._extract_function_calls_from_response(response)
+            if function_calls and not available_functions:
+                self._emit_call_completed_event(
+                    response=function_calls,
+                    call_type=LLMCallType.TOOL_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params.get("input", []),
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    response_id=response_id,
+                )
+                return function_calls
+
+            if function_calls and available_functions:
+                for call in function_calls:
+                    function_name = call.get("name", "")
+                    function_args = call.get("arguments", {})
+                    if isinstance(function_args, str):
+                        try:
+                            function_args = json.loads(function_args)
+                        except json.JSONDecodeError:
+                            function_args = {}
+
+                    result = self._handle_tool_execution(
+                        function_name=function_name,
+                        function_args=function_args,
+                        available_functions=available_functions,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                    )
+
+                    if result is not None:
+                        return result
+
+            content = response.output_text or ""
+
+            if response_model:
+                try:
+                    structured_result = self._validate_structured_output(
+                        content, response_model
+                    )
+                    self._emit_call_completed_event(
+                        response=structured_result,
+                        call_type=LLMCallType.LLM_CALL,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        messages=params.get("input", []),
+                        usage=usage,
+                        finish_reason=finish_reason,
+                        response_id=response_id,
+                    )
+                    return structured_result
+                except ValueError as e:
+                    logging.warning(f"Structured output validation failed: {e}")
+
+            content = self._apply_stop_words(content)
+
+            self._emit_call_completed_event(
+                response=content,
+                call_type=LLMCallType.LLM_CALL,
+                from_task=from_task,
+                from_agent=from_agent,
+                messages=params.get("input", []),
+                usage=usage,
+                finish_reason=finish_reason,
+                response_id=response_id,
+            )
+
+            content = self._invoke_after_llm_call_hooks(
+                params.get("input", []), content, from_agent
+            )
+
+        except NotFoundError as e:
+            error_msg = f"Model {self.model} not found: {e}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ValueError(error_msg) from e
+        except APIConnectionError as e:
+            error_msg = f"Failed to connect to OpenAI API: {e}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ConnectionError(error_msg) from e
+        except Exception as e:
+            if is_context_length_exceeded(e):
+                logging.error(f"Context window exceeded: {e}")
+                raise LLMContextLengthExceededError(str(e)) from e
+
+            error_msg = f"OpenAI Responses API call failed: {e!s}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise
+
+        return content
+
+    async def _ahandle_responses(
+        self,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | ResponsesAPIResult | Any:
+        """Handle async non-streaming Responses API call."""
+        try:
+            response: Response = await self._get_async_client().responses.create(
+                **params
+            )
+
+            if self.auto_chain and response.id:
+                self._last_response_id = response.id
+
+            if self.auto_chain_reasoning:
+                reasoning_items = self._extract_reasoning_items(response)
+                if reasoning_items:
+                    self._last_reasoning_items = reasoning_items
+
+            usage = self._extract_responses_token_usage(response)
+            self._track_token_usage_internal(usage)
+
+            finish_reason, response_id = self._extract_responses_finish_reason_and_id(
+                response
+            )
+
+            if self.parse_tool_outputs:
+                parsed_result = self._extract_builtin_tool_outputs(response)
+                parsed_result.text = self._apply_stop_words(parsed_result.text)
+
+                self._emit_call_completed_event(
+                    response=parsed_result.text,
+                    call_type=LLMCallType.LLM_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params.get("input", []),
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    response_id=response_id,
+                )
+
+                return parsed_result
+
+            function_calls = self._extract_function_calls_from_response(response)
+            if function_calls and not available_functions:
+                self._emit_call_completed_event(
+                    response=function_calls,
+                    call_type=LLMCallType.TOOL_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params.get("input", []),
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    response_id=response_id,
+                )
+                return function_calls
+
+            if function_calls and available_functions:
+                for call in function_calls:
+                    function_name = call.get("name", "")
+                    function_args = call.get("arguments", {})
+                    if isinstance(function_args, str):
+                        try:
+                            function_args = json.loads(function_args)
+                        except json.JSONDecodeError:
+                            function_args = {}
+
+                    result = self._handle_tool_execution(
+                        function_name=function_name,
+                        function_args=function_args,
+                        available_functions=available_functions,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                    )
+
+                    if result is not None:
+                        return result
+
+            content = response.output_text or ""
+
+            if response_model:
+                try:
+                    structured_result = self._validate_structured_output(
+                        content, response_model
+                    )
+                    self._emit_call_completed_event(
+                        response=structured_result,
+                        call_type=LLMCallType.LLM_CALL,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        messages=params.get("input", []),
+                        usage=usage,
+                        finish_reason=finish_reason,
+                        response_id=response_id,
+                    )
+                    return structured_result
+                except ValueError as e:
+                    logging.warning(f"Structured output validation failed: {e}")
+
+            content = self._apply_stop_words(content)
+
+            self._emit_call_completed_event(
+                response=content,
+                call_type=LLMCallType.LLM_CALL,
+                from_task=from_task,
+                from_agent=from_agent,
+                messages=params.get("input", []),
+                usage=usage,
+                finish_reason=finish_reason,
+                response_id=response_id,
+            )
+
+        except NotFoundError as e:
+            error_msg = f"Model {self.model} not found: {e}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ValueError(error_msg) from e
+        except APIConnectionError as e:
+            error_msg = f"Failed to connect to OpenAI API: {e}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ConnectionError(error_msg) from e
+        except Exception as e:
+            if is_context_length_exceeded(e):
+                logging.error(f"Context window exceeded: {e}")
+                raise LLMContextLengthExceededError(str(e)) from e
+
+            error_msg = f"OpenAI Responses API call failed: {e!s}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise
+
+        return content
+
+    def _handle_streaming_responses(
+        self,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | ResponsesAPIResult | Any:
+        """Handle streaming Responses API call."""
+        full_response = ""
+        function_calls: list[dict[str, Any]] = []
+        final_response: Response | None = None
+        usage: dict[str, Any] | None = None
+
+        stream = self._get_sync_client().responses.create(**params)
+        response_id_stream = None
+
+        for event in stream:
+            if event.type == "response.created":
+                response_id_stream = event.response.id
+
+            if event.type == "response.output_text.delta":
+                delta_text = event.delta or ""
+                full_response += delta_text
+                self._emit_stream_chunk_event(
+                    chunk=delta_text,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_id=response_id_stream,
+                )
+
+            elif event.type == "response.function_call_arguments.delta":
+                pass
+
+            elif event.type == "response.output_item.done":
+                item = event.item
+                if item.type == "function_call":
+                    function_calls.append(
+                        {
+                            "id": item.call_id,
+                            "name": item.name,
+                            "arguments": item.arguments,
+                        }
+                    )
+
+            elif event.type == "response.completed":
+                final_response = event.response
+                if self.auto_chain and event.response and event.response.id:
+                    self._last_response_id = event.response.id
+                if self.auto_chain_reasoning and event.response:
+                    reasoning_items = self._extract_reasoning_items(event.response)
+                    if reasoning_items:
+                        self._last_reasoning_items = reasoning_items
+                if event.response and event.response.usage:
+                    usage = self._extract_responses_token_usage(event.response)
+                    self._track_token_usage_internal(usage)
+
+        finish_reason, response_id = (
+            self._extract_responses_finish_reason_and_id(final_response)
+            if final_response is not None
+            else (None, response_id_stream)
+        )
+
+        if self.parse_tool_outputs and final_response:
+            parsed_result = self._extract_builtin_tool_outputs(final_response)
+            parsed_result.text = self._apply_stop_words(parsed_result.text)
+
+            self._emit_call_completed_event(
+                response=parsed_result.text,
+                call_type=LLMCallType.LLM_CALL,
+                from_task=from_task,
+                from_agent=from_agent,
+                messages=params.get("input", []),
+                usage=usage,
+                finish_reason=finish_reason,
+                response_id=response_id,
+            )
+
+            return parsed_result
+
+        if function_calls and available_functions:
+            for call in function_calls:
+                function_name = call.get("name", "")
+                function_args = call.get("arguments", {})
+                if isinstance(function_args, str):
+                    try:
+                        function_args = json.loads(function_args)
+                    except json.JSONDecodeError:
+                        function_args = {}
+
+                result = self._handle_tool_execution(
+                    function_name=function_name,
+                    function_args=function_args,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                )
+
+                if result is not None:
+                    return result
+
+        if response_model:
+            try:
+                structured_result = self._validate_structured_output(
+                    full_response, response_model
+                )
+                self._emit_call_completed_event(
+                    response=structured_result,
+                    call_type=LLMCallType.LLM_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params.get("input", []),
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    response_id=response_id,
+                )
+                return structured_result
+            except ValueError as e:
+                logging.warning(f"Structured output validation failed: {e}")
+
+        full_response = self._apply_stop_words(full_response)
+
+        self._emit_call_completed_event(
+            response=full_response,
+            call_type=LLMCallType.LLM_CALL,
+            from_task=from_task,
+            from_agent=from_agent,
+            messages=params.get("input", []),
+            usage=usage,
+            finish_reason=finish_reason,
+            response_id=response_id,
+        )
+
+        return self._invoke_after_llm_call_hooks(
+            params.get("input", []), full_response, from_agent
+        )
+
+    async def _ahandle_streaming_responses(
+        self,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | ResponsesAPIResult | Any:
+        """Handle async streaming Responses API call."""
+        full_response = ""
+        function_calls: list[dict[str, Any]] = []
+        final_response: Response | None = None
+        usage: dict[str, Any] | None = None
+
+        stream = await self._get_async_client().responses.create(**params)
+        response_id_stream = None
+
+        async for event in stream:
+            if event.type == "response.created":
+                response_id_stream = event.response.id
+
+            if event.type == "response.output_text.delta":
+                delta_text = event.delta or ""
+                full_response += delta_text
+                self._emit_stream_chunk_event(
+                    chunk=delta_text,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_id=response_id_stream,
+                )
+
+            elif event.type == "response.function_call_arguments.delta":
+                pass
+
+            elif event.type == "response.output_item.done":
+                item = event.item
+                if item.type == "function_call":
+                    function_calls.append(
+                        {
+                            "id": item.call_id,
+                            "name": item.name,
+                            "arguments": item.arguments,
+                        }
+                    )
+
+            elif event.type == "response.completed":
+                final_response = event.response
+                if self.auto_chain and event.response and event.response.id:
+                    self._last_response_id = event.response.id
+                if self.auto_chain_reasoning and event.response:
+                    reasoning_items = self._extract_reasoning_items(event.response)
+                    if reasoning_items:
+                        self._last_reasoning_items = reasoning_items
+                if event.response and event.response.usage:
+                    usage = self._extract_responses_token_usage(event.response)
+                    self._track_token_usage_internal(usage)
+
+        finish_reason, response_id = (
+            self._extract_responses_finish_reason_and_id(final_response)
+            if final_response is not None
+            else (None, response_id_stream)
+        )
+
+        if self.parse_tool_outputs and final_response:
+            parsed_result = self._extract_builtin_tool_outputs(final_response)
+            parsed_result.text = self._apply_stop_words(parsed_result.text)
+
+            self._emit_call_completed_event(
+                response=parsed_result.text,
+                call_type=LLMCallType.LLM_CALL,
+                from_task=from_task,
+                from_agent=from_agent,
+                messages=params.get("input", []),
+                usage=usage,
+                finish_reason=finish_reason,
+                response_id=response_id,
+            )
+
+            return parsed_result
+
+        if function_calls and available_functions:
+            for call in function_calls:
+                function_name = call.get("name", "")
+                function_args = call.get("arguments", {})
+                if isinstance(function_args, str):
+                    try:
+                        function_args = json.loads(function_args)
+                    except json.JSONDecodeError:
+                        function_args = {}
+
+                result = self._handle_tool_execution(
+                    function_name=function_name,
+                    function_args=function_args,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                )
+
+                if result is not None:
+                    return result
+
+        if response_model:
+            try:
+                structured_result = self._validate_structured_output(
+                    full_response, response_model
+                )
+                self._emit_call_completed_event(
+                    response=structured_result,
+                    call_type=LLMCallType.LLM_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params.get("input", []),
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    response_id=response_id,
+                )
+                return structured_result
+            except ValueError as e:
+                logging.warning(f"Structured output validation failed: {e}")
+
+        full_response = self._apply_stop_words(full_response)
+
+        self._emit_call_completed_event(
+            response=full_response,
+            call_type=LLMCallType.LLM_CALL,
+            from_task=from_task,
+            from_agent=from_agent,
+            messages=params.get("input", []),
+            usage=usage,
+            finish_reason=finish_reason,
+            response_id=response_id,
+        )
+
+        return full_response
+
+    def _extract_function_calls_from_response(
+        self, response: Response
+    ) -> list[dict[str, Any]]:
+        """Extract function calls from Responses API output."""
+        return [
+            {
+                "id": item.call_id,
+                "name": item.name,
+                "arguments": item.arguments,
+            }
+            for item in response.output
+            if item.type == "function_call"
+        ]
+
+    def _extract_responses_token_usage(self, response: Response) -> dict[str, Any]:
+        """Extract token usage and response metadata from Responses API response."""
+        if response.usage:
+            result: dict[str, Any] = {
+                "prompt_tokens": response.usage.input_tokens,
+                "completion_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+            input_details = getattr(response.usage, "input_tokens_details", None)
+            if input_details:
+                result["cached_prompt_tokens"] = (
+                    getattr(input_details, "cached_tokens", 0) or 0
+                )
+            output_details = getattr(response.usage, "output_tokens_details", None)
+            if output_details:
+                result["reasoning_tokens"] = (
+                    getattr(output_details, "reasoning_tokens", 0) or 0
+                )
+            return result
+        return {"total_tokens": 0}
+
+    def _extract_builtin_tool_outputs(self, response: Response) -> ResponsesAPIResult:
+        """Extract and parse all built-in tool outputs from Responses API.
+
+        Parses web_search, file_search, code_interpreter, computer_use,
+        and reasoning outputs into structured types.
+
+        Args:
+            response: The OpenAI Response object.
+
+        Returns:
+            ResponsesAPIResult containing parsed outputs.
+        """
+        result = ResponsesAPIResult(
+            text=response.output_text or "",
+            response_id=response.id,
+        )
+
+        for item in response.output:
+            if isinstance(item, ResponseFunctionWebSearch):
+                result.web_search_results.append(
+                    WebSearchResult(
+                        id=item.id,
+                        status=item.status,
+                        type=item.type,
+                    )
+                )
+
+            elif isinstance(item, ResponseFileSearchToolCall):
+                file_results: list[FileSearchResultItem] = (
+                    [
+                        FileSearchResultItem(
+                            file_id=r.file_id,
+                            filename=r.filename,
+                            text=r.text,
+                            score=r.score,
+                            attributes=r.attributes,
+                        )
+                        for r in item.results
+                    ]
+                    if item.results
+                    else []
+                )
+                result.file_search_results.append(
+                    FileSearchResult(
+                        id=item.id,
+                        status=item.status,
+                        type=item.type,
+                        queries=list(item.queries),
+                        results=file_results,
+                    )
+                )
+
+            elif isinstance(item, ResponseCodeInterpreterToolCall):
+                code_results: list[
+                    CodeInterpreterLogResult | CodeInterpreterFileResult
+                ] = []
+                for r in item.outputs or []:
+                    if r.type == "logs":
+                        code_results.append(
+                            CodeInterpreterLogResult(type="logs", logs=r.logs)
+                        )
+                    elif r.type == "image":
+                        code_results.append(
+                            CodeInterpreterFileResult(
+                                type="files",
+                                files=[{"url": r.url}],
+                            )
+                        )
+                result.code_interpreter_results.append(
+                    CodeInterpreterResult(
+                        id=item.id,
+                        status=item.status,
+                        type=item.type,
+                        code=item.code,
+                        container_id=item.container_id,
+                        results=code_results,
+                    )
+                )
+
+            elif isinstance(item, ResponseComputerToolCall):
+                action_dict = item.action.model_dump() if item.action else {}
+                safety_checks = [
+                    {"id": c.id, "code": c.code, "message": c.message}
+                    for c in item.pending_safety_checks
+                ]
+                result.computer_use_results.append(
+                    ComputerUseResult(
+                        id=item.id,
+                        status=item.status,
+                        type=item.type,
+                        call_id=item.call_id,
+                        action=action_dict,
+                        pending_safety_checks=safety_checks,
+                    )
+                )
+
+            elif isinstance(item, ResponseReasoningItem):
+                summaries = [{"type": s.type, "text": s.text} for s in item.summary]
+                result.reasoning_summaries.append(
+                    ReasoningSummary(
+                        id=item.id,
+                        status=item.status,
+                        type=item.type,
+                        summary=summaries,
+                        encrypted_content=item.encrypted_content,
+                    )
+                )
+
+            elif isinstance(item, ResponseFunctionToolCall):
+                result.function_calls.append(
+                    {
+                        "id": item.call_id,
+                        "name": item.name,
+                        "arguments": item.arguments,
+                    }
+                )
+
+        return result
+
+    def _extract_reasoning_items(self, response: Response) -> list[Any]:
+        """Extract reasoning items with encrypted content from response.
+
+        Used for ZDR (Zero Data Retention) compliance to capture encrypted
+        reasoning tokens that can be passed back in subsequent requests.
+
+        Args:
+            response: The OpenAI Response object.
+
+        Returns:
+            List of reasoning items from the response output that have
+            encrypted_content, suitable for passing back in future requests.
+        """
+        return [item for item in response.output if item.type == "reasoning"]
+
+    @staticmethod
+    def _is_responses_only_error(error: BaseException) -> bool:
+        """Whether a 404 means the model exists but isn't on chat completions.
+
+        OpenAI distinguishes the two 404s it returns here:
+
+            responses-only  param="model", "only supported in v1/responses"
+                            or "This is not a chat model"
+            genuine typo    code="model_not_found", "does not exist"
+
+        Matching the former lets a newly Responses-only model be recovered without
+        needing to be listed in this file.
+        """
+        if not isinstance(error, NotFoundError):
+            return False
+        body = getattr(error, "body", None)
+        inner = body.get("error") if isinstance(body, dict) else None
+        if isinstance(inner, dict) and inner.get("code") == "model_not_found":
+            return False
+        text = str(getattr(error, "message", "") or error).lower()
+        return "only supported in v1/responses" in text or "not a chat model" in text
+
+    def _remember_responses_only_model(self) -> None:
+        """Record that this model must use the Responses API."""
+        _LEARNED_RESPONSES_ONLY_MODELS.add(self.model)
+
+    def _model_not_found_message(self, error: Exception) -> str:
+        """Build a 404 message that says what to do about it.
+
+        OpenAI's own wording ("This is not a chat model") doesn't make the fix
+        obvious, so point at ``api="responses"`` when that's what it means.
+        """
+        if self._is_responses_only_error(error):
+            return (
+                f"Model {self.model} is not available on /v1/chat/completions. "
+                f'Use api="responses" (LLM(model="{self.model}", api="responses")) '
+                f"to reach it: {error}"
+            )
+        return f"Model {self.model} not found: {error}"
+
+    @staticmethod
+    def _rejects_reasoning_effort_with_tools(error: BaseException) -> bool:
+        """Whether a 400 is OpenAI refusing `reasoning_effort` alongside tools.
+
+        GPT-5.6 applies a server-side `reasoning_effort` default and then rejects
+        it when function tools are present, so a payload carrying no
+        `reasoning_effort` at all still fails:
+
+            "Function tools with reasoning_effort are not supported for
+            gpt-5.6-sol in /v1/chat/completions. To use function tools, use
+            /v1/responses or set reasoning_effort to 'none'."
+
+        Matched on the structured `param` field plus the message so the unrelated
+        "Unsupported value" 400 that o1/o3 return for `reasoning_effort="none"`
+        doesn't look recoverable.
+        """
+        if not isinstance(error, BadRequestError):
+            return False
+        body = getattr(error, "body", None)
+        source = None
+        if isinstance(body, dict):
+            inner = body.get("error")
+            source = inner if isinstance(inner, dict) else body
+        if not source or source.get("param") != "reasoning_effort":
+            return False
+        message = str(source.get("message") or "").lower()
+        return "function tools" in message and "reasoning_effort" in message
+
+    def _sends_reasoning_effort(self) -> bool:
+        """Whether `reasoning_effort` goes on the wire for this model.
+
+        OpenAI's own models are matched by shape. A compatible server names its
+        models in its own namespace, so the name says nothing about support
+        there and the explicit setting is honoured. Either way, a model that
+        has rejected the parameter on this endpoint in this process is not
+        sent it again.
+        """
+        if self._reasoning_effort_key() in _LEARNED_NO_REASONING_EFFORT_MODELS:
+            return False
+        return self._on_compatible_server() or _supports_reasoning_effort(self.model)
+
+    def _effective_base_url(self) -> str | None:
+        """The base URL the client is built with; None means OpenAI's own API.
+
+        Same precedence as `_get_client_params`, where `client_params` win. The
+        SDK accepts ``str | httpx.URL`` there and `_get_client_params` forwards
+        either, so both are normalised to the string the client will call.
+        """
+        override = (self.client_params or {}).get("base_url")
+        if isinstance(override, (str, httpx.URL)) and str(override):
+            return str(override)
+        return (
+            self.base_url
+            or self.api_base
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("OPENAI_API_BASE")
+        )
+
+    def _on_compatible_server(self) -> bool:
+        """Whether requests go to an OpenAI-compatible server rather than OpenAI.
+
+        Decided by where the client actually points -- an explicit ``base_url``
+        or ``api_base``, the ``OPENAI_BASE_URL``/``OPENAI_API_BASE`` env, or the
+        URL a provider subclass resolves -- because ``custom_openai`` is only
+        set on some of those paths.
+        """
+        if self.custom_openai:
+            return True
+        url = self._effective_base_url()
+        if not url:
+            return False
+        return urlsplit(url).hostname != _OPENAI_API_HOST
+
+    def _reasoning_effort_key(self) -> tuple[str, str]:
+        return (self._effective_base_url() or _OPENAI_API_HOST, self.model)
+
+    def _remember_no_reasoning_effort_model(self) -> None:
+        """Record that this model rejected `reasoning_effort`.
+
+        Called once the retry without the parameter has succeeded, so a retry
+        that fails for an unrelated reason leaves the setting in place for the
+        next call instead of silently dropping it for the rest of the process.
+        """
+        logging.warning(
+            "%r rejected reasoning_effort=%r; the call succeeded without it, and "
+            "it will not be sent to this model again in this process.",
+            self.model,
+            self.reasoning_effort,
+        )
+        _LEARNED_NO_REASONING_EFFORT_MODELS.add(self._reasoning_effort_key())
+
+    def _rejects_reasoning_effort_as_unsupported(self, error: BaseException) -> bool:
+        """Whether a 400 is the server refusing `reasoning_effort` for this model.
+
+        Non-reasoning models reject the parameter itself, in one of two shapes:
+
+            {"code": "unsupported_parameter", "param": "reasoning_effort",
+             "message": "Unsupported parameter: 'reasoning_effort' is not
+             supported with this model."}
+
+            {"param": null, "message": "Unrecognized request argument
+             supplied: reasoning_effort"}
+
+        Distinct from `_rejects_reasoning_effort_with_tools`: that is a
+        reasoning model refusing the parameter only alongside function tools,
+        and it recovers by sending "none" rather than by dropping the key. Also
+        deliberately does not match the "Unsupported value" 400 that o1/o3
+        return for a bad *value* -- the model does support the parameter, so
+        silently dropping it would restore the very bug this recovers from.
+
+        A compatible server words the same rejection its own way -- "unknown
+        field", "Extra inputs are not permitted" -- so the message is matched
+        against the common phrasings, read from the body's `message` or from
+        the error text when the body is not the OpenAI shape. A 400 (or 422)
+        that names the parameter without saying it is unknown is a bad value,
+        or the tools case, and surfaces.
+        """
+        if not isinstance(error, (BadRequestError, UnprocessableEntityError)):
+            return False
+        body = getattr(error, "body", None)
+        source: dict[str, Any] = {}
+        if isinstance(body, dict):
+            inner = body.get("error")
+            source = inner if isinstance(inner, dict) else body
+        message = str(
+            source.get("message") or getattr(error, "message", "") or error
+        ).lower()
+        if "reasoning_effort" not in message:
+            return False
+        if source.get("code") == "unsupported_parameter":
+            return True
+        return any(phrase in message for phrase in _UNKNOWN_PARAMETER_PHRASES)
+
+    @staticmethod
+    def _without_reasoning_effort(params: dict[str, Any]) -> dict[str, Any] | None:
+        """Params with `reasoning_effort` removed, or None if it was not set."""
+        if "reasoning_effort" not in params:
+            return None
+        return {k: v for k, v in params.items() if k != "reasoning_effort"}
+
+    def _reasoning_effort_none_params(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Params with an explicit `reasoning_effort="none"`, or None if already set.
+
+        Removing the key is not enough: absence means "use the server default",
+        which is what the request was rejected for in the first place.
+        """
+        if params.get("reasoning_effort") == "none":
+            return None
+        return {**params, "reasoning_effort": "none"}
+
+    def _effective_api(self) -> str:
+        """Which OpenAI API to actually use for this model.
+
+        Honours an explicit ``api`` setting, but upgrades to ``"responses"`` for
+        models already known -- from a previous 404 in this process -- not to be
+        served by chat completions.
+
+        Never overrides ``custom_openai=True``: an OpenAI-compatible server may
+        serve any model name on /v1/chat/completions and most don't implement
+        /v1/responses at all, so the user's choice stands.
+        """
+        if (
+            self.api == "completions"
+            and not self.custom_openai
+            and self.model in _LEARNED_RESPONSES_ONLY_MODELS
+        ):
+            return "responses"
+        return self.api
+
+    def _prepare_completion_params(
+        self, messages: list[LLMMessage], tools: list[dict[str, BaseTool]] | None = None
+    ) -> dict[str, Any]:
+        """Prepare parameters for OpenAI chat completion."""
+        params: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if self._effective_stream():
+            params["stream"] = self._effective_stream()
+            params["stream_options"] = {"include_usage": True}
+
+        params.update(self.additional_params)
+
+        if self.temperature is not None:
+            params["temperature"] = self.temperature
+        if self.top_p is not None:
+            params["top_p"] = self.top_p
+        if self.frequency_penalty is not None:
+            params["frequency_penalty"] = self.frequency_penalty
+        if self.presence_penalty is not None:
+            params["presence_penalty"] = self.presence_penalty
+        if self.max_completion_tokens is not None:
+            params["max_completion_tokens"] = self.max_completion_tokens
+        elif self.max_tokens is not None:
+            params["max_tokens"] = self.max_tokens
+        if self.seed is not None:
+            params["seed"] = self.seed
+        if self.logprobs is not None:
+            params["logprobs"] = self.logprobs
+        if self.top_logprobs is not None:
+            params["top_logprobs"] = self.top_logprobs
+
+        # Not gated on `is_o1_model`: that is a literal "o1" substring test, so
+        # gpt-5, o3 and o4-mini failed it and silently thought at the server
+        # default. It also drives tool support and message rewriting, so it
+        # cannot be widened to mean "is a reasoning model".
+        if self.reasoning_effort and self._sends_reasoning_effort():
+            params["reasoning_effort"] = self.reasoning_effort
+
+        if self.response_format is not None:
+            if isinstance(self.response_format, type) and issubclass(
+                self.response_format, BaseModel
+            ):
+                params["response_format"] = generate_model_description(
+                    self.response_format
+                )
+            elif isinstance(self.response_format, dict):
+                params["response_format"] = self.response_format
+
+        if tools:
+            params["tools"] = self._convert_tools_for_interference(tools)
+            params["tool_choice"] = "auto"
+
+        crewai_specific_params = {
+            "callbacks",
+            "available_functions",
+            "from_task",
+            "from_agent",
+            "provider",
+            "api_key",
+            "base_url",
+            "api_base",
+            "timeout",
+        }
+
+        return {k: v for k, v in params.items() if k not in crewai_specific_params}
+
+    def _convert_tools_for_interference(
+        self, tools: list[dict[str, BaseTool]]
+    ) -> list[dict[str, Any]]:
+        """Convert CrewAI tool format to OpenAI function calling format."""
+        openai_tools = []
+
+        for tool in tools:
+            name, description, parameters = safe_tool_conversion(tool, "OpenAI")
+
+            openai_tool: dict[str, Any] = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "strict": True,
+                },
+            }
+
+            if parameters:
+                params_dict = (
+                    parameters if isinstance(parameters, dict) else dict(parameters)
+                )
+                openai_tool["function"]["parameters"] = (
+                    sanitize_tool_params_for_openai_strict(params_dict)
+                )
+
+            openai_tools.append(openai_tool)
+        return openai_tools
+
+    def _handle_completion(
+        self,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Handle non-streaming chat completion."""
+        try:
+            if response_model:
+                parse_params = {
+                    k: v for k, v in params.items() if k != "response_format"
+                }
+                raw_parsed = self._get_sync_client().beta.chat.completions.with_raw_response.parse(
+                    **parse_params,
+                    response_format=response_model,
+                )
+                _raise_for_upstream_error(
+                    raw_parsed.text,
+                    model=self.model,
+                    http_response=raw_parsed.http_response,
+                )
+                parsed_response = raw_parsed.parse()
+                math_reasoning = parsed_response.choices[0].message
+
+                if math_reasoning.refusal:
+                    pass
+
+                usage = self._extract_openai_token_usage(parsed_response)
+                self._track_token_usage_internal(usage)
+
+                parsed_finish_reason, parsed_response_id = (
+                    self._extract_chat_finish_reason_and_id(parsed_response)
+                )
+                parsed_object = parsed_response.choices[0].message.parsed
+                if parsed_object:
+                    self._emit_call_completed_event(
+                        response=parsed_object.model_dump_json(),
+                        call_type=LLMCallType.LLM_CALL,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        messages=params["messages"],
+                        usage=usage,
+                        finish_reason=parsed_finish_reason,
+                        response_id=parsed_response_id,
+                    )
+                    return parsed_object
+
+            raw_response = (
+                self._get_sync_client().chat.completions.with_raw_response.create(
+                    **params
+                )
+            )
+            _raise_for_upstream_error(
+                raw_response.text,
+                model=self.model,
+                http_response=raw_response.http_response,
+            )
+            response: ChatCompletion = raw_response.parse()
+
+            usage = self._extract_openai_token_usage(response)
+
+            self._track_token_usage_internal(usage)
+
+            choice: Choice = response.choices[0]
+            message = choice.message
+            finish_reason, response_id = self._extract_chat_finish_reason_and_id(
+                response
+            )
+
+            # Without available_functions, return tool_calls so the caller (executor) handles execution
+            if message.tool_calls and not available_functions:
+                self._emit_call_completed_event(
+                    response=list(message.tool_calls),
+                    call_type=LLMCallType.TOOL_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params["messages"],
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    response_id=response_id,
+                )
+                return list(message.tool_calls)
+
+            if message.tool_calls and available_functions:
+                tool_call = message.tool_calls[0]
+                if not isinstance(tool_call, ChatCompletionMessageFunctionToolCall):
+                    return message.content
+                function_name = tool_call.function.name
+
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    logging.error(f"Failed to parse tool arguments: {e}")
+                    function_args = {}
+
+                result = self._handle_tool_execution(
+                    function_name=function_name,
+                    function_args=function_args,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                )
+
+                if result is not None:
+                    return result
+
+            content = message.content or ""
+
+            if self.response_format and isinstance(self.response_format, type):
+                try:
+                    structured_result = self._validate_structured_output(
+                        content, self.response_format
+                    )
+                    self._emit_call_completed_event(
+                        response=structured_result,
+                        call_type=LLMCallType.LLM_CALL,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        messages=params["messages"],
+                        usage=usage,
+                        finish_reason=finish_reason,
+                        response_id=response_id,
+                    )
+                    return structured_result
+                except ValueError as e:
+                    logging.warning(f"Structured output validation failed: {e}")
+
+            content = self._apply_stop_words(content)
+
+            self._emit_call_completed_event(
+                response=content,
+                call_type=LLMCallType.LLM_CALL,
+                from_task=from_task,
+                from_agent=from_agent,
+                messages=params["messages"],
+                usage=usage,
+                finish_reason=finish_reason,
+                response_id=response_id,
+            )
+
+            if usage.get("total_tokens", 0) > 0:
+                logging.info(f"OpenAI API usage: {usage}")
+
+            content = self._invoke_after_llm_call_hooks(
+                params["messages"], content, from_agent
+            )
+        except NotFoundError as e:
+            error_msg = self._model_not_found_message(e)
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ValueError(error_msg) from e
+        except APIConnectionError as e:
+            error_msg = f"Failed to connect to OpenAI API: {e}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ConnectionError(error_msg) from e
+        except Exception as e:
+            if is_context_length_exceeded(e):
+                logging.error(f"Context window exceeded: {e}")
+                raise LLMContextLengthExceededError(str(e)) from e
+
+            # `_call_completions` retries these, so reporting a failed call
+            # here would surface an error the caller never experiences.
+            if self._rejects_reasoning_effort_with_tools(
+                e
+            ) or self._rejects_reasoning_effort_as_unsupported(e):
+                raise
+
+            error_msg = f"OpenAI API call failed: {e!s}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise e from e
+
+        return content
+
+    def _finalize_streaming_response(
+        self,
+        full_response: str,
+        tool_calls: dict[int, dict[str, Any]],
+        usage_data: dict[str, Any] | None,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        finish_reason: str | None = None,
+        response_id: str | None = None,
+    ) -> str | list[dict[str, Any]]:
+        """Finalize a streaming response with usage tracking, tool call handling, and events.
+
+        Args:
+            full_response: The accumulated text response from the stream.
+            tool_calls: Accumulated tool calls from the stream, keyed by index.
+            usage_data: Token usage data from the stream, or None if unavailable.
+            params: The completion parameters containing messages.
+            available_functions: Available functions for tool calling.
+            from_task: Task that initiated the call.
+            from_agent: Agent that initiated the call.
+            finish_reason: Raw provider finish reason (e.g. "stop", "length",
+                "tool_calls") extracted from the last streaming chunk.
+            response_id: Raw provider response id from any chunk.
+
+        Returns:
+            Tool calls list when tools were invoked without available_functions,
+            tool execution result when available_functions is provided,
+            or the text response string.
+        """
+        if usage_data:
+            self._track_token_usage_internal(usage_data)
+
+        if tool_calls and not available_functions:
+            tool_calls_list = [
+                {
+                    "id": call_data["id"],
+                    "type": "function",
+                    "function": {
+                        "name": call_data["name"],
+                        "arguments": call_data["arguments"],
+                    },
+                    "index": call_data["index"],
+                }
+                for call_data in tool_calls.values()
+            ]
+            self._emit_call_completed_event(
+                response=tool_calls_list,
+                call_type=LLMCallType.TOOL_CALL,
+                from_task=from_task,
+                from_agent=from_agent,
+                messages=params["messages"],
+                usage=usage_data,
+                finish_reason=finish_reason,
+                response_id=response_id,
+            )
+            return tool_calls_list
+
+        if tool_calls and available_functions:
+            for call_data in tool_calls.values():
+                function_name = call_data["name"]
+                arguments = call_data["arguments"]
+
+                if not function_name or not arguments:
+                    continue
+
+                if function_name not in available_functions:
+                    logging.warning(
+                        f"Function '{function_name}' not found in available functions"
+                    )
+                    continue
+
+                try:
+                    function_args = json.loads(arguments)
+                except json.JSONDecodeError as e:
+                    logging.error(f"Failed to parse streamed tool arguments: {e}")
+                    continue
+
+                result = self._handle_tool_execution(
+                    function_name=function_name,
+                    function_args=function_args,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                )
+
+                if result is not None:
+                    return result
+
+        full_response = self._apply_stop_words(full_response)
+
+        self._emit_call_completed_event(
+            response=full_response,
+            call_type=LLMCallType.LLM_CALL,
+            from_task=from_task,
+            from_agent=from_agent,
+            messages=params["messages"],
+            usage=usage_data,
+            finish_reason=finish_reason,
+            response_id=response_id,
+        )
+
+        return full_response
+
+    def _handle_streaming_completion(
+        self,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | list[dict[str, Any]] | BaseModel:
+        """Handle streaming chat completion."""
+        full_response = ""
+        tool_calls: dict[int, dict[str, Any]] = {}
+
+        if response_model:
+            parse_params = {
+                k: v
+                for k, v in params.items()
+                if k not in ("response_format", "stream")
+            }
+
+            stream: ChatCompletionStream[BaseModel]
+            with self._get_sync_client().beta.chat.completions.stream(
+                **parse_params, response_format=response_model
+            ) as stream:
+                for chunk in stream:
+                    response_id_stream = chunk.id if hasattr(chunk, "id") else None
+
+                    if chunk.type == "content.delta":
+                        delta_content = chunk.delta
+                        if delta_content:
+                            self._emit_stream_chunk_event(
+                                chunk=delta_content,
+                                from_task=from_task,
+                                from_agent=from_agent,
+                                response_id=response_id_stream,
+                            )
+
+                final_completion = stream.get_final_completion()
+                if final_completion:
+                    usage = self._extract_openai_token_usage(final_completion)
+                    self._track_token_usage_internal(usage)
+                    parsed_finish_reason, parsed_response_id = (
+                        self._extract_chat_finish_reason_and_id(final_completion)
+                    )
+                    if final_completion.choices:
+                        parsed_result = final_completion.choices[0].message.parsed
+                        if parsed_result:
+                            self._emit_call_completed_event(
+                                response=parsed_result.model_dump_json(),
+                                call_type=LLMCallType.LLM_CALL,
+                                from_task=from_task,
+                                from_agent=from_agent,
+                                messages=params["messages"],
+                                usage=usage,
+                                finish_reason=parsed_finish_reason,
+                                response_id=parsed_response_id,
+                            )
+                            return parsed_result
+
+            logging.error("Failed to get parsed result from stream")
+            return ""
+
+        completion_stream: Stream[ChatCompletionChunk] = (
+            self._get_sync_client().chat.completions.create(**params)
+        )
+
+        usage_data: dict[str, Any] | None = None
+        stream_finish_reason: str | None = None
+        stream_response_id: str | None = None
+
+        for completion_chunk in completion_stream:
+            response_id_stream = (
+                completion_chunk.id if hasattr(completion_chunk, "id") else None
+            )
+            if response_id_stream:
+                stream_response_id = response_id_stream
+
+            if hasattr(completion_chunk, "usage") and completion_chunk.usage:
+                usage_data = self._extract_openai_token_usage(completion_chunk)
+                continue
+
+            if not completion_chunk.choices:
+                continue
+
+            choice = completion_chunk.choices[0]
+            chunk_delta: ChoiceDelta = choice.delta
+            chunk_finish = getattr(choice, "finish_reason", None)
+            if chunk_finish:
+                stream_finish_reason = chunk_finish
+
+            if chunk_delta.content:
+                full_response += chunk_delta.content
+                self._emit_stream_chunk_event(
+                    chunk=chunk_delta.content,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_id=response_id_stream,
+                )
+
+            if chunk_delta.tool_calls:
+                for tool_call in chunk_delta.tool_calls:
+                    tool_index = tool_call.index if tool_call.index is not None else 0
+                    if tool_index not in tool_calls:
+                        tool_calls[tool_index] = {
+                            "id": tool_call.id,
+                            "name": "",
+                            "arguments": "",
+                            "index": tool_index,
+                        }
+                    elif tool_call.id and not tool_calls[tool_index]["id"]:
+                        tool_calls[tool_index]["id"] = tool_call.id
+
+                    if tool_call.function and tool_call.function.name:
+                        tool_calls[tool_index]["name"] = tool_call.function.name
+                    if tool_call.function and tool_call.function.arguments:
+                        tool_calls[tool_index]["arguments"] += (
+                            tool_call.function.arguments
+                        )
+
+                    self._emit_stream_chunk_event(
+                        chunk=tool_call.function.arguments
+                        if tool_call.function and tool_call.function.arguments
+                        else "",
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        tool_call={
+                            "id": tool_calls[tool_index]["id"],
+                            "function": {
+                                "name": tool_calls[tool_index]["name"],
+                                "arguments": tool_calls[tool_index]["arguments"],
+                            },
+                            "type": "function",
+                            "index": tool_calls[tool_index]["index"],
+                        },
+                        call_type=LLMCallType.TOOL_CALL,
+                        response_id=response_id_stream,
+                    )
+
+        result = self._finalize_streaming_response(
+            full_response=full_response,
+            tool_calls=tool_calls,
+            usage_data=usage_data,
+            params=params,
+            available_functions=available_functions,
+            from_task=from_task,
+            from_agent=from_agent,
+            finish_reason=stream_finish_reason,
+            response_id=stream_response_id,
+        )
+        if isinstance(result, str):
+            return self._invoke_after_llm_call_hooks(
+                params["messages"], result, from_agent
+            )
+        return result
+
+    async def _ahandle_completion(
+        self,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Handle non-streaming async chat completion."""
+        try:
+            if response_model:
+                parse_params = {
+                    k: v for k, v in params.items() if k != "response_format"
+                }
+                raw_parsed = await self._get_async_client().beta.chat.completions.with_raw_response.parse(
+                    **parse_params,
+                    response_format=response_model,
+                )
+                _raise_for_upstream_error(
+                    raw_parsed.text,
+                    model=self.model,
+                    http_response=raw_parsed.http_response,
+                )
+                parsed_response = raw_parsed.parse()
+                math_reasoning = parsed_response.choices[0].message
+
+                if math_reasoning.refusal:
+                    pass
+
+                usage = self._extract_openai_token_usage(parsed_response)
+                self._track_token_usage_internal(usage)
+
+                parsed_finish_reason, parsed_response_id = (
+                    self._extract_chat_finish_reason_and_id(parsed_response)
+                )
+                parsed_object = parsed_response.choices[0].message.parsed
+                if parsed_object:
+                    self._emit_call_completed_event(
+                        response=parsed_object.model_dump_json(),
+                        call_type=LLMCallType.LLM_CALL,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        messages=params["messages"],
+                        usage=usage,
+                        finish_reason=parsed_finish_reason,
+                        response_id=parsed_response_id,
+                    )
+                    return parsed_object
+
+            raw_response = await self._get_async_client().chat.completions.with_raw_response.create(
+                **params
+            )
+            _raise_for_upstream_error(
+                raw_response.text,
+                model=self.model,
+                http_response=raw_response.http_response,
+            )
+            response: ChatCompletion = raw_response.parse()
+
+            usage = self._extract_openai_token_usage(response)
+
+            self._track_token_usage_internal(usage)
+
+            choice: Choice = response.choices[0]
+            message = choice.message
+            finish_reason, response_id = self._extract_chat_finish_reason_and_id(
+                response
+            )
+
+            # Without available_functions, return tool_calls so the caller (executor) handles execution
+            if message.tool_calls and not available_functions:
+                self._emit_call_completed_event(
+                    response=list(message.tool_calls),
+                    call_type=LLMCallType.TOOL_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params["messages"],
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    response_id=response_id,
+                )
+                return list(message.tool_calls)
+
+            if message.tool_calls and available_functions:
+                from openai.types.chat.chat_completion_message_function_tool_call import (
+                    ChatCompletionMessageFunctionToolCall,
+                )
+
+                tool_call = message.tool_calls[0]
+                if not isinstance(tool_call, ChatCompletionMessageFunctionToolCall):
+                    return message.content
+                function_name = tool_call.function.name
+
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    logging.error(f"Failed to parse tool arguments: {e}")
+                    function_args = {}
+
+                result = self._handle_tool_execution(
+                    function_name=function_name,
+                    function_args=function_args,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                )
+
+                if result is not None:
+                    return result
+
+            content = message.content or ""
+
+            if self.response_format and isinstance(self.response_format, type):
+                try:
+                    structured_result = self._validate_structured_output(
+                        content, self.response_format
+                    )
+                    self._emit_call_completed_event(
+                        response=structured_result,
+                        call_type=LLMCallType.LLM_CALL,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        messages=params["messages"],
+                        usage=usage,
+                        finish_reason=finish_reason,
+                        response_id=response_id,
+                    )
+                    return structured_result
+                except ValueError as e:
+                    logging.warning(f"Structured output validation failed: {e}")
+
+            content = self._apply_stop_words(content)
+
+            self._emit_call_completed_event(
+                response=content,
+                call_type=LLMCallType.LLM_CALL,
+                from_task=from_task,
+                from_agent=from_agent,
+                messages=params["messages"],
+                usage=usage,
+                finish_reason=finish_reason,
+                response_id=response_id,
+            )
+
+            if usage.get("total_tokens", 0) > 0:
+                logging.info(f"OpenAI API usage: {usage}")
+        except NotFoundError as e:
+            error_msg = self._model_not_found_message(e)
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ValueError(error_msg) from e
+        except APIConnectionError as e:
+            error_msg = f"Failed to connect to OpenAI API: {e}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise ConnectionError(error_msg) from e
+        except Exception as e:
+            if is_context_length_exceeded(e):
+                logging.error(f"Context window exceeded: {e}")
+                raise LLMContextLengthExceededError(str(e)) from e
+
+            # `_call_completions` retries these, so reporting a failed call
+            # here would surface an error the caller never experiences.
+            if self._rejects_reasoning_effort_with_tools(
+                e
+            ) or self._rejects_reasoning_effort_as_unsupported(e):
+                raise
+
+            error_msg = f"OpenAI API call failed: {e!s}"
+            logging.error(error_msg)
+            self._emit_call_failed_event(
+                error=error_msg, from_task=from_task, from_agent=from_agent
+            )
+            raise e from e
+
+        return content
+
+    async def _ahandle_streaming_completion(
+        self,
+        params: dict[str, Any],
+        available_functions: dict[str, Any] | None = None,
+        from_task: Any | None = None,
+        from_agent: Any | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | list[dict[str, Any]] | BaseModel:
+        """Handle async streaming chat completion."""
+        full_response = ""
+        tool_calls: dict[int, dict[str, Any]] = {}
+
+        if response_model:
+            completion_stream: AsyncIterator[
+                ChatCompletionChunk
+            ] = await self._get_async_client().chat.completions.create(**params)
+
+            accumulated_content = ""
+            usage_data: dict[str, Any] | None = None
+            parsed_stream_finish_reason: str | None = None
+            parsed_stream_response_id: str | None = None
+            async for chunk in completion_stream:
+                response_id_stream = chunk.id if hasattr(chunk, "id") else None
+                if response_id_stream:
+                    parsed_stream_response_id = response_id_stream
+
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage_data = self._extract_openai_token_usage(chunk)
+                    continue
+
+                if not chunk.choices:
+                    continue
+
+                choice = chunk.choices[0]
+                delta: ChoiceDelta = choice.delta
+                chunk_finish = getattr(choice, "finish_reason", None)
+                if chunk_finish:
+                    parsed_stream_finish_reason = chunk_finish
+
+                if delta.content:
+                    accumulated_content += delta.content
+                    self._emit_stream_chunk_event(
+                        chunk=delta.content,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        response_id=response_id_stream,
+                    )
+
+            if usage_data:
+                self._track_token_usage_internal(usage_data)
+
+            try:
+                parsed_object = response_model.model_validate_json(accumulated_content)
+
+                self._emit_call_completed_event(
+                    response=parsed_object.model_dump_json(),
+                    call_type=LLMCallType.LLM_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params["messages"],
+                    usage=usage_data,
+                    finish_reason=parsed_stream_finish_reason,
+                    response_id=parsed_stream_response_id,
+                )
+
+                return parsed_object
+            except Exception as e:
+                logging.error(f"Failed to parse structured output from stream: {e}")
+                self._emit_call_completed_event(
+                    response=accumulated_content,
+                    call_type=LLMCallType.LLM_CALL,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    messages=params["messages"],
+                    usage=usage_data,
+                    finish_reason=parsed_stream_finish_reason,
+                    response_id=parsed_stream_response_id,
+                )
+                return accumulated_content
+
+        stream: AsyncIterator[
+            ChatCompletionChunk
+        ] = await self._get_async_client().chat.completions.create(**params)
+
+        usage_data = None
+        stream_finish_reason: str | None = None
+        stream_response_id: str | None = None
+
+        async for chunk in stream:
+            response_id_stream = chunk.id if hasattr(chunk, "id") else None
+            if response_id_stream:
+                stream_response_id = response_id_stream
+
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage_data = self._extract_openai_token_usage(chunk)
+                continue
+
+            if not chunk.choices:
+                continue
+
+            choice = chunk.choices[0]
+            chunk_delta: ChoiceDelta = choice.delta
+            chunk_finish = getattr(choice, "finish_reason", None)
+            if chunk_finish:
+                stream_finish_reason = chunk_finish
+
+            if chunk_delta.content:
+                full_response += chunk_delta.content
+                self._emit_stream_chunk_event(
+                    chunk=chunk_delta.content,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_id=response_id_stream,
+                )
+
+            if chunk_delta.tool_calls:
+                for tool_call in chunk_delta.tool_calls:
+                    tool_index = tool_call.index if tool_call.index is not None else 0
+                    if tool_index not in tool_calls:
+                        tool_calls[tool_index] = {
+                            "id": tool_call.id,
+                            "name": "",
+                            "arguments": "",
+                            "index": tool_index,
+                        }
+                    elif tool_call.id and not tool_calls[tool_index]["id"]:
+                        tool_calls[tool_index]["id"] = tool_call.id
+
+                    if tool_call.function and tool_call.function.name:
+                        tool_calls[tool_index]["name"] = tool_call.function.name
+                    if tool_call.function and tool_call.function.arguments:
+                        tool_calls[tool_index]["arguments"] += (
+                            tool_call.function.arguments
+                        )
+
+                    self._emit_stream_chunk_event(
+                        chunk=tool_call.function.arguments
+                        if tool_call.function and tool_call.function.arguments
+                        else "",
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        tool_call={
+                            "id": tool_calls[tool_index]["id"],
+                            "function": {
+                                "name": tool_calls[tool_index]["name"],
+                                "arguments": tool_calls[tool_index]["arguments"],
+                            },
+                            "type": "function",
+                            "index": tool_calls[tool_index]["index"],
+                        },
+                        call_type=LLMCallType.TOOL_CALL,
+                        response_id=response_id_stream,
+                    )
+
+        return self._finalize_streaming_response(
+            full_response=full_response,
+            tool_calls=tool_calls,
+            usage_data=usage_data,
+            params=params,
+            available_functions=available_functions,
+            from_task=from_task,
+            from_agent=from_agent,
+            finish_reason=stream_finish_reason,
+            response_id=stream_response_id,
+        )
+
+    def supports_function_calling(self) -> bool:
+        """Check if the model supports function calling."""
+        return not self.is_o1_model
+
+    def supports_stop_words(self) -> bool:
+        """Check if the model supports stop words."""
+        model_lower = self.model.lower() if self.model else ""
+        if "gpt-5" in model_lower:
+            return False
+        return not self.is_o1_model
+
+    def get_context_window_size(self) -> int:
+        """Get the context window size for the model."""
+        from crewai.llm import CONTEXT_WINDOW_USAGE_RATIO, LLM_CONTEXT_WINDOW_SIZES
+
+        min_context = 1024
+        max_context = 2097152
+
+        for key, value in LLM_CONTEXT_WINDOW_SIZES.items():
+            if value < min_context or value > max_context:
+                raise ValueError(
+                    f"Context window for {key} must be between {min_context} and {max_context}"
+                )
+
+        # Longest prefix first. Always insert new keys in that order so
+        # startswith prefers gpt-5.6 over gpt-5, gpt-4o-mini over gpt-4o, etc.
+        context_windows = {
+            "gpt-4.1-mini-2025-04-14": 1047576,
+            "gpt-4.1-nano-2025-04-14": 1047576,
+            "gpt-5.4-mini": 200000,
+            "gpt-4-turbo": 128000,
+            "gpt-4o-mini": 128000,
+            "gpt-5-mini": 1047576,
+            "gpt-5-nano": 1047576,
+            "o1-preview": 128000,
+            "gpt-5.6": 1050000,
+            "o1-mini": 128000,
+            "o3-mini": 200000,
+            "o4-mini": 200000,
+            "gpt-4.1": 1047576,
+            "gpt-4o": 128000,
+            "gpt-5": 1047576,
+            "gpt-4": 8192,
+        }
+
+        for model_prefix, size in context_windows.items():
+            if self.model.startswith(model_prefix):
+                return int(size * CONTEXT_WINDOW_USAGE_RATIO)
+
+        return int(8192 * CONTEXT_WINDOW_USAGE_RATIO)
+
+    def _effective_max_tokens(self) -> int | float | None:
+        """Newer OpenAI chat models cap via ``max_completion_tokens``."""
+        return self.max_tokens or self.max_completion_tokens
+
+    @staticmethod
+    def _extract_chat_finish_reason_and_id(
+        response: Any,
+    ) -> tuple[str | None, str | None]:
+        """ChatCompletion / ChatCompletionChunk share the choices-shape;
+        delegate to the shared extractor.
+        """
+        return extract_choices_finish_reason_and_id(response)
+
+    @staticmethod
+    def _extract_responses_finish_reason_and_id(
+        response: Any,
+    ) -> tuple[str | None, str | None]:
+        """Extract finish_reason and response_id from an OpenAI Responses
+        API ``Response`` object. The Responses API exposes ``status`` rather
+        than ``finish_reason``; we forward the raw status value.
+        """
+        return (
+            getattr(response, "status", None),
+            getattr(response, "id", None),
+        )
+
+    def _extract_openai_token_usage(
+        self, response: ChatCompletion | ChatCompletionChunk
+    ) -> dict[str, Any]:
+        """Extract token usage and response metadata from OpenAI ChatCompletion."""
+        if hasattr(response, "usage") and response.usage:
+            usage = response.usage
+            result: dict[str, Any] = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage, "completion_tokens", 0),
+                "total_tokens": getattr(usage, "total_tokens", 0),
+            }
+            prompt_details = getattr(usage, "prompt_tokens_details", None)
+            if prompt_details:
+                result["cached_prompt_tokens"] = (
+                    getattr(prompt_details, "cached_tokens", 0) or 0
+                )
+            completion_details = getattr(usage, "completion_tokens_details", None)
+            if completion_details:
+                result["reasoning_tokens"] = (
+                    getattr(completion_details, "reasoning_tokens", 0) or 0
+                )
+            return result
+        return {"total_tokens": 0}
+
+    def _format_messages(self, messages: str | list[LLMMessage]) -> list[LLMMessage]:
+        """Format messages for OpenAI API."""
+        base_formatted = super()._format_messages(messages)
+
+        formatted_messages: list[LLMMessage] = []
+
+        for message in base_formatted:
+            if self.is_o1_model and message.get("role") == "system":
+                formatted_messages.append(
+                    {"role": "user", "content": f"System: {message['content']}"}
+                )
+            else:
+                formatted_messages.append(message)
+
+        return formatted_messages
+
+    def supports_multimodal(self) -> bool:
+        """Check if the model supports multimodal inputs.
+
+        OpenAI vision-enabled models include GPT-4o, GPT-4.1, GPT-5, and o-series.
+
+        Returns:
+            True if the model supports images.
+        """
+        vision_models = (
+            "gpt-4o",
+            "gpt-4.1",
+            "gpt-4-turbo",
+            "gpt-4-vision",
+            "gpt-5",
+            "o1",
+            "o3",
+            "o4",
+        )
+        return any(self.model.lower().startswith(m) for m in vision_models)
+
+    def get_file_uploader(self) -> Any:
+        """Get an OpenAI file uploader using this LLM's clients.
+
+        Returns:
+            OpenAIFileUploader instance with pre-configured sync and async clients.
+        """
+        try:
+            from crewai_files.uploaders.openai import OpenAIFileUploader
+
+            return OpenAIFileUploader(
+                client=self._get_sync_client(),
+                async_client=self._get_async_client(),
+            )
+        except ImportError:
+            return None

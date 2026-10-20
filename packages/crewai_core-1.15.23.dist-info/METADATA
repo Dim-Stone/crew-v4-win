@@ -1,0 +1,31 @@
+Metadata-Version: 2.5
+Name: crewai-core
+Version: 1.15.23
+Summary: Shared utilities for CrewAI — version, paths, user-data, telemetry, printer.
+Project-URL: Homepage, https://crewai.com
+Project-URL: Documentation, https://docs.crewai.com
+Project-URL: Repository, https://github.com/crewAIInc/crewAI
+Author-email: "Greyson R. LaLonde" <greyson@crewai.com>
+Requires-Python: <3.14,>=3.10
+Requires-Dist: appdirs~=1.4.4
+Requires-Dist: cryptography>=42.0
+Requires-Dist: httpx~=0.28.1
+Requires-Dist: opentelemetry-api<2,>=1.42
+Requires-Dist: opentelemetry-exporter-otlp-proto-http<2,>=1.42
+Requires-Dist: opentelemetry-sdk<2,>=1.42
+Requires-Dist: packaging>=23.0
+Requires-Dist: portalocker~=2.7.0
+Requires-Dist: pydantic<2.13,>=2.11.9
+Requires-Dist: pyjwt<3,>=2.13.0
+Requires-Dist: rich>=13.7.1
+Requires-Dist: tomli~=2.0.2
+Description-Content-Type: text/markdown
+
+# crewai-core
+
+Shared utilities used by both `crewai` and `crewai-cli`: version lookup, storage
+paths, user-data helpers, telemetry, and the printer.
+
+This package is a leaf — it has no dependency on the `crewai` framework — and is
+pulled in transitively by `crewai` and `crewai-cli`. End users do not normally
+install it directly.

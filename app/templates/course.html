@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}上课 · CREW{% endblock %}
+
+{% block head_extra %}
+  <!-- 公式渲染（KaTeX）。本地文件，离线可用；缺失时 latex.js 自动回退 CDN。
+       defer 保证它在页面 module 脚本之前执行，首屏公式即可渲染。 -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}">
+  <script defer src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}"></script>
+{% endblock %}
+
+{% block body %}
+<div class="workbench">
+  <!-- 左栏：章节时间轴（既是导航，也是进度）。
+       **切换知识点只从这里走**——对话区不再放"上一节/下一节"之类的按钮，
+       否则同一个动作有两个入口，讲到哪一节会变得说不清。 -->
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <!-- 回课程列表的入口。顶栏的"CREW"也是回到工作台，但它看起来像品牌、
+           不像按钮；在课程页里"怎么回去"是最常问的一件事，所以给一个明确的。 -->
+      <a class="back-link" href="/">← 我的课程</a>
+      <div class="title" id="course-title">加载中…</div>
+      <div class="sub" id="course-progress"></div>
+    </div>
+    <ul class="timeline" id="timeline"></ul>
+  </aside>
+
+  <!-- 右栏：对话区。
+       左上角竖排一列「谁在动手」（备课 / 取资料 / 讲 / 画图），右边一句
+       "系统正在怎么适应你"（没有调整时整条隐藏）。两者都**不加框**——
+       它们是状态说明，不是按钮。
+       **操作都聚到输入区上方那一排**（快捷追问 + 画成图解），鼠标不用上下跑。 -->
+  <section class="chat-area">
+    <div class="chat-bar">
+      <div class="crew" id="crew" aria-label="此刻在动手的智能体"></div>
+      <div class="adaptation" id="adaptation"></div>
+      <!-- 课堂是**另一个页面**（/course/<id>/class），不是这里的一个视图状态：
+           两者需要的地方完全不同——对话要左栏与输入框，课堂要整块屏幕。
+           做成两级页面之后，课堂页不必再和左栏挤一个 grid，也就不会
+           出现"卡片被压到 300px 宽"那种问题。 -->
+      <button type="button" class="classroom-entry" id="chapter-test"
+              title="这一章的整章测试（可导出 Word）">章末测试</button>
+      <a class="classroom-entry" id="class-link" href="/course/{{ course_id }}/class">
+        <span id="class-progress">进入课堂</span> →
+      </a>
+    </div>
+
+    <div class="chat-scroll" id="scroll">
+      <div class="chat" id="chat"></div>
+    </div>
+
+    <div class="composer-bar">
+      <!-- 快捷追问 + 画成图解：点一下等于把那句话打出来发出去。
+           句子都挑的是后端真会处理的说法（"没懂"会被当成太难、"继续吧"才会翻页），
+           所以它不是另一条捷径，只是省掉打字。 -->
+      <div class="chips" id="chips"></div>
+      <div class="composer">
+        <textarea id="message" rows="1"
+                  placeholder="开始这一节 / 继续吧 / 这里没懂 / 举个例子"></textarea>
+        <button id="send" class="primary">发送</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- 进度尺：贴右边缘的可折叠小窗。
+     折叠时整个面板滑出屏幕，只剩最左边那个按钮卡在边缘上；
+     点它展开，里面是三件事——
+       · 这一节走到第几步（刻度来自后端的教案进度，不是猜的）；
+       · 讲过的知识点列表，点哪一条就跳回那一段（长对话里靠它定位）；
+       · 这次打开期间存下的讲义（路径来自后端推的 saved 事件，见下）。 -->
+<aside class="rail" id="rail" aria-label="学习进度与定位">
+  <button class="rail-toggle" id="progress-toggle" type="button"
+          aria-expanded="false" aria-controls="rail-body" title="展开进度与定位">
+    <span class="rail-caret" aria-hidden="true"></span>
+  </button>
+
+  <div class="rail-body" id="rail-body">
+    <section class="rail-block">
+      <h2 class="rail-label">这一节</h2>
+      <div class="rail-point" id="rail-point">—</div>
+      <ol class="rail-steps" id="rail-steps"></ol>
+      <p class="rail-note" id="rail-note"></p>
+    </section>
+
+    <section class="rail-block">
+      <h2 class="rail-label">讲到过</h2>
+      <ul class="rail-index" id="rail-index"></ul>
+    </section>
+
+    <section class="rail-block">
+      <h2 class="rail-label">存下的讲义</h2>
+      <ul class="rail-files" id="rail-files"></ul>
+      <p class="rail-note">
+        讲义每轮自动落盘（存到 notes/ 目录），这里列的是<strong>这次打开页面之后</strong>存下的。
+      </p>
+    </section>
+  </div>
+</aside>
+{% endblock %}

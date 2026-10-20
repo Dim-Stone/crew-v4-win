@@ -1,0 +1,257 @@
+"""Prompt generation and management utilities for CrewAI agents."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+from crewai.utilities.i18n import I18N_DEFAULT
+
+
+VALID_DATE_FORMAT_CODES = (
+    "%Y",
+    "%m",
+    "%d",
+    "%H",
+    "%M",
+    "%S",
+    "%B",
+    "%b",
+    "%A",
+    "%a",
+)
+
+
+class StandardPromptResult(BaseModel):
+    """Result with only prompt field for standard mode."""
+
+    prompt: str = Field(default="")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key) and getattr(self, key) is not None
+
+
+class SystemPromptResult(StandardPromptResult):
+    """Result with system, user, and prompt fields for system prompt mode."""
+
+    system: str = Field(default="")
+    user: str = Field(default="")
+
+
+COMPONENTS = Literal[
+    "role_playing",
+    "tools",
+    "no_tools",
+    "native_tools",
+    "task",
+    "native_task",
+    "task_no_tools",
+]
+
+
+class Prompts(BaseModel):
+    """Manages and generates prompts for a generic agent.
+
+    Notes:
+        - Need to refactor so that prompt is not tightly coupled to agent.
+    """
+
+    has_tools: bool = Field(
+        default=False, description="Indicates if the agent has access to tools"
+    )
+    use_native_tool_calling: bool = Field(
+        default=False,
+        description="Whether to use native function calling instead of ReAct format",
+    )
+    system_template: str | None = Field(
+        default=None, description="Custom system prompt template"
+    )
+    prompt_template: str | None = Field(
+        default=None, description="Custom user prompt template"
+    )
+    response_template: str | None = Field(
+        default=None, description="Custom response prompt template"
+    )
+    use_system_prompt: bool = Field(
+        default=False,
+        description="Whether to use the system prompt when no custom templates are provided",
+    )
+    agent: Any = Field(description="Reference to the agent using these prompts")
+    skill_loader_tool_name: str | None = Field(
+        default=None,
+        description="Name the runtime skill loader tool is registered under",
+    )
+
+    def task_execution(self) -> SystemPromptResult | StandardPromptResult:
+        """Generate a standard prompt for task execution.
+
+        Returns:
+            A dictionary containing the constructed prompt(s).
+        """
+        slices: list[COMPONENTS] = ["role_playing"]
+        if self.has_tools:
+            if not self.use_native_tool_calling:
+                slices.append("tools")
+        else:
+            slices.append("no_tools")
+        system: str = (
+            self._build_prompt(slices)
+            + self._build_skill_block()
+            + self._build_date_block()
+        )
+
+        task_slice: COMPONENTS
+        if self.use_native_tool_calling:
+            task_slice = "native_task"
+        elif self.has_tools:
+            task_slice = "task"
+        else:
+            task_slice = "task_no_tools"
+        slices.append(task_slice)
+
+        if (
+            not self.system_template
+            and not self.prompt_template
+            and self.use_system_prompt
+        ):
+            return SystemPromptResult(
+                system=system,
+                user=self._build_prompt([task_slice]),
+                prompt=self._build_prompt(slices)
+                + self._build_skill_block()
+                + self._build_date_block(),
+            )
+        return StandardPromptResult(
+            prompt=self._build_prompt(
+                slices,
+                self.system_template,
+                self.prompt_template,
+                self.response_template,
+            )
+            + self._build_skill_block()
+            + self._build_date_block()
+        )
+
+    def _build_date_block(self) -> str:
+        """Render the current date when the agent has ``inject_date`` enabled.
+
+        Kept at the tail of the prompt so the stable prefix ahead of it stays
+        usable as a prompt-cache anchor.
+        """
+        if not getattr(self.agent, "inject_date", False):
+            return ""
+
+        date_format = getattr(self.agent, "date_format", "%Y-%m-%d")
+        try:
+            if not any(code in date_format for code in VALID_DATE_FORMAT_CODES):
+                raise ValueError(f"Invalid date format: {date_format}")
+            current_date = datetime.now().strftime(date_format)
+        except Exception as e:
+            logger = getattr(self.agent, "_logger", None)
+            if logger is not None:
+                logger.log("warning", f"Failed to inject date: {e!s}")
+            return ""
+
+        return f"\n\nCurrent Date: {current_date}"
+
+    def _build_skill_block(self) -> str:
+        """Render always-on instructions and the available skill catalog.
+
+        Metadata-only skills remain a stable prompt-cache anchor. Their full
+        instructions are disclosed through the runtime loader tool only when the
+        model determines that a skill applies to the current request.
+        """
+        skills = getattr(self.agent, "skills", None)
+        if not skills:
+            return ""
+
+        from crewai.skills.loader import build_skill_catalog, format_skill_context
+        from crewai.skills.models import INSTRUCTIONS, Skill
+        from crewai.skills.tool import LOAD_SKILL_TOOL_NAME
+
+        loaded = [skill for skill in skills if isinstance(skill, Skill)]
+        active = [
+            format_skill_context(skill)
+            for skill in loaded
+            if skill.disclosure_level >= INSTRUCTIONS
+        ]
+        catalog = build_skill_catalog(loaded)
+
+        blocks: list[str] = []
+        if active:
+            blocks.append("<skills>\n" + "\n\n".join(active) + "\n</skills>")
+        if catalog:
+            loader = self.skill_loader_tool_name or LOAD_SKILL_TOOL_NAME
+            entries = "\n\n".join(
+                format_skill_context(skill, label=label)
+                for label, skill in catalog.items()
+            )
+            blocks.append(
+                "<available_skills>\n"
+                "These skills are not loaded. Most requests need none of them, "
+                "so answer directly unless one clearly applies to this request. "
+                f"When one does, call `{loader}` with its exact name to load its "
+                "full instructions, and do not follow a skill's instructions "
+                "without loading it first.\n\n"
+                f"{entries}\n"
+                "</available_skills>"
+            )
+        if not blocks:
+            return ""
+        return "\n\n" + "\n\n".join(blocks)
+
+    def _build_prompt(
+        self,
+        components: list[COMPONENTS],
+        system_template: str | None = None,
+        prompt_template: str | None = None,
+        response_template: str | None = None,
+    ) -> str:
+        """Constructs a prompt string from specified components.
+
+        Args:
+            components: List of component names to include in the prompt.
+            system_template: Optional custom template for the system prompt.
+            prompt_template: Optional custom template for the user prompt.
+            response_template: Optional custom template for the response prompt.
+
+        Returns:
+            The constructed prompt string.
+        """
+        prompt: str
+        if not system_template or not prompt_template:
+            prompt_parts: list[str] = [
+                I18N_DEFAULT.slice(component) for component in components
+            ]
+            prompt = "".join(prompt_parts)
+        else:
+            template_parts: list[str] = [
+                I18N_DEFAULT.slice(component)
+                for component in components
+                if component != "task"
+            ]
+            system: str = system_template.replace(
+                "{{ .System }}", "".join(template_parts)
+            )
+            prompt = prompt_template.replace(
+                "{{ .Prompt }}", "".join(I18N_DEFAULT.slice("task"))
+            )
+            if response_template:
+                response: str = response_template.split("{{ .Response }}")[0]
+                prompt = f"{system}\n{prompt}\n{response}"
+            else:
+                prompt = f"{system}\n{prompt}"
+
+        return (
+            prompt.replace("{goal}", self.agent.goal)
+            .replace("{role}", self.agent.role)
+            .replace("{backstory}", self.agent.backstory)
+        )

@@ -1,0 +1,12 @@
+google_re2-1.1.20251105.dist-info/DELVEWHEEL,sha256=QgTGCznYmKrJ2LiJ4BiVSoTzzoaGM871AphLWJsyHVU,16
+google_re2-1.1.20251105.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+google_re2-1.1.20251105.dist-info/METADATA,sha256=J0L5qTCE991R76mw2JMmJZyyCtPjrxeNmI4iztlO0XI,2409
+google_re2-1.1.20251105.dist-info/RECORD,,
+google_re2-1.1.20251105.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+google_re2-1.1.20251105.dist-info/WHEEL,sha256=HiKqpJQCpuUwUTusxInON5SlakXBmhquVSOz6FWj3kA,110
+google_re2-1.1.20251105.dist-info/licenses/LICENSE,sha256=UDuzzGa9Xw0HDKa7cAKqZ4QDJ5zzqN5kjzK23fyUAYQ,1585
+google_re2-1.1.20251105.dist-info/top_level.txt,sha256=-68pj14yD7p0WrE0v9RCDXTHx_WdghsWCieA3utx3N4,9
+google_re2.libs/msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll,sha256=pMIim9wqKmMKzcCVtNhgCOXD47x3cxdDVPPaT1vrnN4,575056
+re2/__init__.py,sha256=hr2QR5ULMV4ztWEQTwfRNwmewmqJN9PX0RlPDCMQjgQ,18588
+re2/__pycache__/__init__.cpython-313.pyc,,
+re2/_re2.cp313-win_amd64.pyd,sha256=Z_6IPCJm2cbbImtut55oeJi1G3MXKYI5ElTP3tgGMtM,635904

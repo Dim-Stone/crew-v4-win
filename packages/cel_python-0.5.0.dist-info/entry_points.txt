@@ -1,0 +1,2 @@
+[console_scripts]
+cel-python = cel_python:main

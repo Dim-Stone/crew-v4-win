@@ -1,0 +1,234 @@
+{% extends "base.html" %}
+{% block title %}设置 · CREW{% endblock %}
+
+{% block body %}
+<main class="page">
+
+  <div class="section-head">
+    <div>
+      <h1>设置</h1>
+      <p class="faint">改完点保存就生效，<strong>不用重启</strong>——所以正在跑的讲课不会被打断。</p>
+    </div>
+  </div>
+
+  <!-- 第一次使用：只在没有密钥时出现。
+       为什么不直接把整个页面锁住：万一密钥是坏的（或者模型端点临时不通），
+       锁住会让人连"改回来"的地方都进不去。所以是**醒目提示**，不是墙。 -->
+  <section class="first-run" id="first-run" hidden>
+    <h2>第一次使用，先填一个密钥</h2>
+    <ol class="first-run-steps">
+      <li>到 <a href="https://platform.deepseek.com/api_keys" target="_blank"
+                rel="noreferrer">platform.deepseek.com</a> 注册并创建一个 API 密钥（形如
+        <code class="mono">sk-…</code>）。</li>
+      <li>把它粘贴到下面的<strong>「API 密钥」</strong>，点「保存并测试」。</li>
+      <li>看到绿色提示就可以用了——回到课程页新建一门课。</li>
+    </ol>
+    <p class="hint">
+      密钥只存在这台电脑的这个文件夹里（<code class="mono">.env</code>），
+      不会上传到任何地方；界面上始终显示成掩码。
+    </p>
+  </section>
+
+  <form class="settings-form" id="llm-form" autocomplete="off">
+    <section class="setting-card">
+      <h2>模型连接</h2>
+      <p class="hint">
+        这个应用本身不联网；它只是把每一轮的备课与讲课交给大模型来做，
+        所以这里必须填一个能用的密钥。值存在项目根目录的
+        <code id="env-file" class="mono">.env</code> 里——那是明文文件，
+        和手动编辑它没有区别，界面上做掩码只是不让它出现在截图里。
+      </p>
+
+      <div class="status-line">
+        <span id="key-status" class="badge">读取中…</span>
+        <span id="key-status-note" class="faint"></span>
+      </div>
+
+      <div class="field">
+        <label for="api-key">API 密钥</label>
+        <div class="key-row">
+          <input id="api-key" name="api_key" type="password" spellcheck="false"
+                 placeholder="sk-…" aria-describedby="api-key-hint">
+          <button class="ghost" type="button" id="key-reveal"
+                  aria-label="换一个密钥">换一个</button>
+          <button class="ghost danger" type="button" id="key-clear">清除</button>
+        </div>
+        <p class="hint" id="api-key-hint">
+          已配置时这里显示一串掩码。<strong>原样留着就是"不改密钥"</strong>，
+          只改模型名也不会把它覆盖掉；要换一个就点"换一个"，要清掉就点"清除"。
+        </p>
+      </div>
+
+      <div class="field">
+        <label for="base-url">接口地址</label>
+        <input id="base-url" name="base_url" type="text" spellcheck="false"
+               placeholder="https://api.deepseek.com">
+        <p class="hint">要以 http:// 或 https:// 开头。DeepSeek 官方端点是
+          <code class="mono">https://api.deepseek.com</code>。</p>
+      </div>
+
+      <div class="pair">
+        <div class="field">
+          <label for="model">模型名</label>
+          <input id="model" name="model" type="text" spellcheck="false" list="model-list"
+                 placeholder="deepseek-flash">
+          <datalist id="model-list"></datalist>
+          <!-- 候选名同时用文字写出来：`<datalist>` 的下拉在部分 WebView 内核里
+               根本不弹（它是"建议"而不是白名单，所以不能换成 <select>），
+               不写出来的话那些内核上的人就看不到建议了。 -->
+          <p class="hint" id="model-hint">可以手输别的名字。</p>
+        </div>
+
+        <div class="field">
+          <label for="temperature">温度</label>
+          <div class="input-suffix">
+            <input id="temperature" name="temperature" type="number"
+                   min="0" max="2" step="0.1" inputmode="decimal">
+            <span class="suffix">0 – 2</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="row-end">
+        <span class="faint" id="save-note"></span>
+        <button type="button" id="test-btn" title="用当前填的密钥连一次端点">
+          保存并测试
+        </button>
+        <button class="primary" type="submit" id="save-btn">保存</button>
+      </div>
+      <p class="hint" id="test-note" hidden></p>
+    </section>
+  </form>
+
+  <!-- 界面：字号、行宽、密度、动效。
+       主题**不在这里** —— 顶栏那个开关就是它，而它必须留在 localStorage
+       （首屏之前就要定下来，否则会闪一下另一种底色，见 base.html 的内联脚本）。
+       同一个设置有两个入口会让人犹豫，所以这里不做第二个。 -->
+  <form class="settings-form" id="prefs-form" autocomplete="off">
+    <section class="setting-card">
+      <h2>界面</h2>
+      <p class="hint">
+        这几项影响所有页面：对话里的讲义、公式、代码块都跟着变。
+        主题在右上角那个开关上——它必须存在浏览器本地（首屏之前就要定下来，
+        否则打开时会先闪一下另一种底色），所以没有放在这里。
+      </p>
+
+      <div class="field">
+        <label>正文字号</label>
+        <div class="choices choices-inline" id="prefs-font_size"></div>
+      </div>
+
+      <div class="field">
+        <label>内容宽度</label>
+        <div class="choices choices-inline" id="prefs-content_width"></div>
+        <p class="hint">一行太长会看串行，太短会频繁换行。三个档位都是按中文正文调过的。</p>
+      </div>
+
+      <div class="field">
+        <label>行间距</label>
+        <div class="choices choices-inline" id="prefs-line_height"></div>
+      </div>
+
+      <div class="field">
+        <label>界面密度</label>
+        <div class="choices choices-inline" id="prefs-density"></div>
+      </div>
+
+      <div class="field">
+        <label>动效</label>
+        <div class="choices choices-inline" id="prefs-reduce_motion"></div>
+      </div>
+
+      <p class="hint hidden" id="prefs-legacy"></p>
+
+      <div class="row-end status-foot">
+        <span class="faint" id="prefs-note"></span>
+        <button class="ghost" type="button" id="prefs-reset">恢复默认</button>
+        <button class="primary" type="submit" id="prefs-save">保存</button>
+      </div>
+    </section>
+  </form>
+
+  <!-- 快捷键：键盘能到的地方就不用鼠标找。
+       列在这里是因为**没有别的地方会告诉用户有快捷键**——不写出来，那几个键
+       等于不存在。这一块是纯展示：真正生效的逻辑在 app/static/js/keys.js。 -->
+  <section class="setting-card">
+    <h2>快捷键</h2>
+    <p class="hint">
+      桌面窗口里都能用。用浏览器打开时（<code class="mono">run_web.py</code>）
+      <code class="mono">Ctrl+数字</code> 会被浏览器抢去切标签页，那就改用
+      <code class="mono">Alt+数字</code>。
+    </p>
+    <dl class="fact-list shortcut-list">
+      <div class="fact">
+        <dt><code class="mono">Ctrl + ,</code></dt>
+        <dd>打开设置</dd>
+      </div>
+      <div class="fact">
+        <dt><code class="mono">Ctrl / Alt + 1 · 2 · 3</code></dt>
+        <dd>课程 · 新建课程 · 设置</dd>
+      </div>
+      <div class="fact">
+        <dt><code class="mono">Ctrl + Enter</code></dt>
+        <dd>发送（焦点不在输入框里也能发）</dd>
+      </div>
+      <div class="fact">
+        <dt><code class="mono">Esc</code></dt>
+        <dd>关掉放大的图解</dd>
+      </div>
+    </dl>
+  </section>
+
+  <!-- 我的画像：只读展示。
+       编辑它的地方是**新建课程向导**（那一页本来就要问这些问题），
+       所以这里不重复做一个编辑器——同一个东西有两个编辑入口，
+       迟早会出现"我在哪一页改的那个值"说不清的情况。 -->
+  <section class="setting-card">
+    <h2>我的画像</h2>
+    <p class="hint">
+      系统对"你是谁、想学什么、怎么讲你更容易懂"的理解。它由摸底问卷生成，
+      之后每一轮讲课的反馈也会影响它。想改就直接改——自动解析不一定准。
+    </p>
+    <div id="profile-body" class="faint">读取中…</div>
+    <div class="row-end status-foot">
+      <a class="faint" href="/new">在新建课程里修订 →</a>
+    </div>
+  </section>
+
+  <!-- 文件位置：你的东西实际放在哪。
+       这一块**只读**——它们决定"文件往哪写"，中途换地方会让同一次运行里的
+       东西分裂到两处去。要改的是启动时的环境变量 CREW_HOME，或者 .env 的
+       LECTURE_DIR，都不是这一页能顺手改的东西。 -->
+  <section class="setting-card">
+    <h2>文件位置</h2>
+    <p class="hint">
+      你的东西实际放在哪。这里<strong>只能看、不能改</strong>：它们决定"文件往哪写"，
+      中途换地方会让同一次运行里的东西分裂到两处去。
+      数据目录由启动时的环境变量 <code class="mono">CREW_HOME</code> 决定
+      （便携用法**不设它**，数据就在项目里）；讲义目录在
+      <code class="mono">.env</code> 的 <code class="mono">LECTURE_DIR</code>。
+      攒下的讲义在「讲义」那一页可以读。
+    </p>
+    <dl class="fact-list" id="locations">
+      <div class="fact"><dt>读取中</dt><dd>…</dd></div>
+    </dl>
+  </section>
+
+  <section class="setting-card">
+    <h2>关于</h2>
+    <p class="hint">
+      界面是普通的 HTML/CSS/JS，由 pywebview 套一个原生窗口显示；
+      在 Windows 上用的是系统自带的 Edge WebView2 内核，所以<strong>没有捆绑浏览器</strong>，
+      整个文件夹可以拷给别人直接用。公式由 KaTeX 渲染、图解由 mermaid.js 渲染，
+      两者的文件都在 <code class="mono">app/static/vendor/</code> 里，离线可用。
+    </p>
+    <div class="status-line">
+      <span id="about-version" class="badge badge-accent">—</span>
+    </div>
+    <div class="row-end status-foot">
+      <a class="faint" href="/">回到课程</a>
+    </div>
+  </section>
+
+</main>
+{% endblock %}

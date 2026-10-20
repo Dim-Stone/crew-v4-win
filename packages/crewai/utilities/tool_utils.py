@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from crewai.agents.parser import AgentAction
+from crewai.agents.tools_handler import ToolsHandler
+from crewai.hooks.tool_hooks import (
+    ToolCallHookContext,
+    run_after_tool_call_hooks,
+    run_before_tool_call_hooks,
+)
+from crewai.security.fingerprint import Fingerprint
+from crewai.tools.structured_tool import CrewStructuredTool
+from crewai.tools.tool_failure import (
+    ToolFailure,
+    ToolFailureReason,
+    handle_tool_failure,
+)
+from crewai.tools.tool_types import ToolResult
+from crewai.tools.tool_usage import ToolUsage, ToolUsageError
+from crewai.utilities.i18n import I18N_DEFAULT
+from crewai.utilities.string_utils import sanitize_tool_name
+
+
+if TYPE_CHECKING:
+    from crewai.agent import Agent
+    from crewai.agents.agent_builder.base_agent import BaseAgent
+    from crewai.crew import Crew
+    from crewai.lite_agent import LiteAgent
+    from crewai.llm import LLM
+    from crewai.llms.base_llm import BaseLLM
+    from crewai.task import Task
+
+
+async def aexecute_tool_and_check_finality(
+    agent_action: AgentAction,
+    tools: list[CrewStructuredTool],
+    agent_key: str | None = None,
+    agent_role: str | None = None,
+    tools_handler: ToolsHandler | None = None,
+    task: Task | None = None,
+    agent: Agent | BaseAgent | LiteAgent | None = None,
+    function_calling_llm: BaseLLM | LLM | None = None,
+    fingerprint_context: dict[str, str] | None = None,
+    crew: Crew | None = None,
+) -> ToolResult:
+    """Execute a tool asynchronously and check if the result should be a final answer.
+
+    This is the async version of execute_tool_and_check_finality. It integrates tool
+    hooks for before and after tool execution, allowing programmatic interception
+    and modification of tool calls.
+
+    Args:
+        agent_action: The action containing the tool to execute.
+        tools: List of available tools.
+        agent_key: Optional key for event emission.
+        agent_role: Optional role for event emission.
+        tools_handler: Optional tools handler for tool execution.
+        task: Optional task for tool execution.
+        agent: Optional agent instance for tool execution.
+        function_calling_llm: Optional LLM for function calling.
+        fingerprint_context: Optional context for fingerprinting.
+        crew: Optional crew instance for hook context.
+
+        Returns:
+        ToolResult containing the execution result and whether it should be
+        treated as a final answer.
+    """
+    tool_name_to_tool_map = {sanitize_tool_name(tool.name): tool for tool in tools}
+
+    if agent_key and agent_role and agent:
+        fingerprint_context = fingerprint_context or {}
+        if agent:
+            if hasattr(agent, "set_fingerprint") and callable(agent.set_fingerprint):
+                if isinstance(fingerprint_context, dict):
+                    try:
+                        fingerprint_obj = Fingerprint.from_dict(fingerprint_context)
+                        agent.set_fingerprint(fingerprint=fingerprint_obj)
+                    except Exception as e:
+                        raise ValueError(f"Failed to set fingerprint: {e}") from e
+
+    tool_usage = ToolUsage(
+        tools_handler=tools_handler,
+        tools=tools,
+        function_calling_llm=function_calling_llm,  # type: ignore[arg-type]
+        task=task,
+        agent=agent,
+        action=agent_action,
+        crew=crew,
+    )
+
+    tool_calling = tool_usage.parse_tool_calling(agent_action.text)
+
+    if isinstance(tool_calling, ToolUsageError):
+        # Mirrors the native paths, which report a malformed call as
+        # INVALID_INPUT rather than passing the message along silently.
+        handle_tool_failure(
+            ToolFailure(
+                message=tool_calling.message,
+                reason=ToolFailureReason.INVALID_INPUT,
+            ),
+            tool_name=getattr(agent_action, "tool", "") or "unknown",
+            tool_args=getattr(agent_action, "tool_input", None),
+            agent=agent,
+            task=task,
+            crew=crew,
+        )
+        return ToolResult(tool_calling.message, False)
+
+    sanitized_tool_name = sanitize_tool_name(tool_calling.tool_name)
+    tool = tool_name_to_tool_map.get(sanitized_tool_name)
+    if tool:
+        tool_input = tool_calling.arguments if tool_calling.arguments else {}
+        hook_context = ToolCallHookContext(
+            tool_name=sanitized_tool_name,
+            tool_input=tool_input,
+            tool=tool,
+            agent=agent,
+            task=task,
+            crew=crew,
+        )
+
+        if run_before_tool_call_hooks(hook_context):
+            blocked_message = (
+                f"Tool execution blocked by hook. Tool: {tool_calling.tool_name}"
+            )
+            # Run POST_TOOL_CALL even on a blocked call so monitoring hooks
+            # still fire, matching the native tool-call paths.
+            blocked_hook_context = ToolCallHookContext(
+                tool_name=sanitized_tool_name,
+                tool_input=tool_input,
+                tool=tool,
+                agent=agent,
+                task=task,
+                crew=crew,
+                tool_result=blocked_message,
+                raw_tool_result=blocked_message,
+            )
+            modified_result = run_after_tool_call_hooks(blocked_hook_context)
+            return ToolResult(
+                modified_result if modified_result is not None else blocked_message,
+                False,
+            )
+
+        tool_result = await tool_usage.ause(tool_calling, agent_action.text)
+        raw_tool_result = tool_usage.get_last_raw_result(tool_result)
+
+        after_hook_context = ToolCallHookContext(
+            tool_name=sanitized_tool_name,
+            tool_input=tool_input,
+            tool=tool,
+            agent=agent,
+            task=task,
+            crew=crew,
+            tool_result=tool_result,
+            raw_tool_result=raw_tool_result,
+        )
+
+        modified_result = run_after_tool_call_hooks(after_hook_context)
+
+        # After the hooks, so post_tool_call can still inspect or rewrite the
+        # result before the policy aborts.
+        if tool_usage.last_failure is not None:
+            handle_tool_failure(
+                tool_usage.last_failure,
+                tool_name=sanitized_tool_name,
+                tool_args=tool_input,
+                tool=tool,
+                agent=agent,
+                task=task,
+                crew=crew,
+            )
+
+        return ToolResult(
+            modified_result if modified_result is not None else tool_result,
+            # A failed tool must not become the final answer -- the same
+            # exclusion the native paths already apply to raised errors.
+            tool.result_as_answer and tool_usage.last_failure is None,
+        )
+
+    tool_result = I18N_DEFAULT.errors("wrong_tool_name").format(
+        tool=sanitized_tool_name,
+        tools=", ".join(tool_name_to_tool_map.keys()),
+    )
+    handle_tool_failure(
+        ToolFailure(
+            message=tool_result,
+            reason=ToolFailureReason.UNKNOWN_TOOL,
+            code=sanitized_tool_name,
+        ),
+        tool_name=sanitized_tool_name,
+        tool_args=tool_calling.arguments,
+        agent=agent,
+        task=task,
+        crew=crew,
+    )
+    return ToolResult(result=tool_result, result_as_answer=False)
+
+
+def execute_tool_and_check_finality(
+    agent_action: AgentAction,
+    tools: list[CrewStructuredTool],
+    agent_key: str | None = None,
+    agent_role: str | None = None,
+    tools_handler: ToolsHandler | None = None,
+    task: Task | None = None,
+    agent: Agent | BaseAgent | LiteAgent | None = None,
+    function_calling_llm: BaseLLM | LLM | None = None,
+    fingerprint_context: dict[str, str] | None = None,
+    crew: Crew | None = None,
+) -> ToolResult:
+    """Execute a tool and check if the result should be treated as a final answer.
+
+    This function integrates tool hooks for before and after tool execution,
+    allowing programmatic interception and modification of tool calls.
+
+    Args:
+        agent_action: The action containing the tool to execute
+        tools: List of available tools
+        agent_key: Optional key for event emission
+        agent_role: Optional role for event emission
+        tools_handler: Optional tools handler for tool execution
+        task: Optional task for tool execution
+        agent: Optional agent instance for tool execution
+        function_calling_llm: Optional LLM for function calling
+        fingerprint_context: Optional context for fingerprinting
+        crew: Optional crew instance for hook context
+
+    Returns:
+        ToolResult containing the execution result and whether it should be treated as a final answer
+    """
+    tool_name_to_tool_map = {sanitize_tool_name(tool.name): tool for tool in tools}
+
+    if agent_key and agent_role and agent:
+        fingerprint_context = fingerprint_context or {}
+        if agent:
+            if hasattr(agent, "set_fingerprint") and callable(agent.set_fingerprint):
+                if isinstance(fingerprint_context, dict):
+                    try:
+                        fingerprint_obj = Fingerprint.from_dict(fingerprint_context)
+                        agent.set_fingerprint(fingerprint=fingerprint_obj)
+                    except Exception as e:
+                        raise ValueError(f"Failed to set fingerprint: {e}") from e
+
+    tool_usage = ToolUsage(
+        tools_handler=tools_handler,
+        tools=tools,
+        function_calling_llm=function_calling_llm,  # type: ignore[arg-type]
+        task=task,
+        agent=agent,
+        action=agent_action,
+        crew=crew,
+    )
+
+    tool_calling = tool_usage.parse_tool_calling(agent_action.text)
+
+    if isinstance(tool_calling, ToolUsageError):
+        # Mirrors the native paths, which report a malformed call as
+        # INVALID_INPUT rather than passing the message along silently.
+        handle_tool_failure(
+            ToolFailure(
+                message=tool_calling.message,
+                reason=ToolFailureReason.INVALID_INPUT,
+            ),
+            tool_name=getattr(agent_action, "tool", "") or "unknown",
+            tool_args=getattr(agent_action, "tool_input", None),
+            agent=agent,
+            task=task,
+            crew=crew,
+        )
+        return ToolResult(tool_calling.message, False)
+
+    sanitized_tool_name = sanitize_tool_name(tool_calling.tool_name)
+    tool = tool_name_to_tool_map.get(sanitized_tool_name)
+    if tool:
+        tool_input = tool_calling.arguments if tool_calling.arguments else {}
+        hook_context = ToolCallHookContext(
+            tool_name=sanitized_tool_name,
+            tool_input=tool_input,
+            tool=tool,
+            agent=agent,
+            task=task,
+            crew=crew,
+        )
+
+        if run_before_tool_call_hooks(hook_context):
+            blocked_message = (
+                f"Tool execution blocked by hook. Tool: {tool_calling.tool_name}"
+            )
+            # Run POST_TOOL_CALL even on a blocked call so monitoring hooks
+            # still fire, matching the native tool-call paths.
+            blocked_hook_context = ToolCallHookContext(
+                tool_name=sanitized_tool_name,
+                tool_input=tool_input,
+                tool=tool,
+                agent=agent,
+                task=task,
+                crew=crew,
+                tool_result=blocked_message,
+                raw_tool_result=blocked_message,
+            )
+            modified_result = run_after_tool_call_hooks(blocked_hook_context)
+            return ToolResult(
+                modified_result if modified_result is not None else blocked_message,
+                False,
+            )
+
+        tool_result = tool_usage.use(tool_calling, agent_action.text)
+        raw_tool_result = tool_usage.get_last_raw_result(tool_result)
+
+        after_hook_context = ToolCallHookContext(
+            tool_name=sanitized_tool_name,
+            tool_input=tool_input,
+            tool=tool,
+            agent=agent,
+            task=task,
+            crew=crew,
+            tool_result=tool_result,
+            raw_tool_result=raw_tool_result,
+        )
+
+        modified_result = run_after_tool_call_hooks(after_hook_context)
+
+        # After the hooks, so post_tool_call can still inspect or rewrite the
+        # result before the policy aborts.
+        if tool_usage.last_failure is not None:
+            handle_tool_failure(
+                tool_usage.last_failure,
+                tool_name=sanitized_tool_name,
+                tool_args=tool_input,
+                tool=tool,
+                agent=agent,
+                task=task,
+                crew=crew,
+            )
+
+        return ToolResult(
+            modified_result if modified_result is not None else tool_result,
+            # A failed tool must not become the final answer -- the same
+            # exclusion the native paths already apply to raised errors.
+            tool.result_as_answer and tool_usage.last_failure is None,
+        )
+
+    tool_result = I18N_DEFAULT.errors("wrong_tool_name").format(
+        tool=sanitized_tool_name,
+        tools=", ".join(tool_name_to_tool_map.keys()),
+    )
+    handle_tool_failure(
+        ToolFailure(
+            message=tool_result,
+            reason=ToolFailureReason.UNKNOWN_TOOL,
+            code=sanitized_tool_name,
+        ),
+        tool_name=sanitized_tool_name,
+        tool_args=tool_calling.arguments,
+        agent=agent,
+        task=task,
+        crew=crew,
+    )
+    return ToolResult(result=tool_result, result_as_answer=False)

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}章末测试 · CREW{% endblock %}
+
+{% block head_extra %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}">
+  <script defer src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}"></script>
+{% endblock %}
+
+{% block body %}
+<!-- 章末测试：一章讲完之后的中型测试。
+     与每节小测共用判分与信号，区别是**按知识点归因**（判完能看出哪一点薄弱），
+     并且可以导出 Word 打印。 -->
+<div class="chapter-test" id="ct-root">
+  <header class="ct-bar">
+    <a class="back-link" href="/course/{{ course_id }}">← 回到课程</a>
+    <span class="ct-title" id="ct-title">章末测试</span>
+    <span class="ct-hint" id="ct-hint"></span>
+    <span class="ct-spacer"></span>
+    <button type="button" id="ct-export" hidden>导出 Word</button>
+  </header>
+
+  <main class="ct-stage">
+    <!-- ① 设置 -->
+    <section class="quiz-setup" id="ct-setup">
+      <div class="quiz-row">
+        <label for="ct-chapter">章节</label>
+        <select id="ct-chapter"></select>
+        <span class="quiz-hint">可以切到别的章：按那一章的重难点出题</span>
+      </div>
+      <div class="quiz-row">
+        <label for="ct-count">题数</label>
+        <input type="number" id="ct-count" min="5" max="15" value="10">
+        <span class="quiz-hint">5–15 题，默认 10：整章每个知识点都要有位置</span>
+      </div>
+      <div class="quiz-row quiz-types" id="ct-types">
+        <label><input type="checkbox" value="single_choice" checked> 单选题</label>
+        <label><input type="checkbox" value="multi_choice" checked> 多选题</label>
+        <label><input type="checkbox" value="fill" checked> 填空题</label>
+        <label><input type="checkbox" value="judge" checked> 判断题</label>
+      </div>
+      <div class="quiz-row">
+        <button type="button" class="primary" id="ct-start">开始出题</button>
+        <button type="button" id="ct-skip">跳过这次</button>
+      </div>
+      <p class="quiz-hint">跳过不记成绩，也不算通过。</p>
+    </section>
+
+    <!-- ② 作答 -->
+    <div class="quiz-body" id="ct-body" hidden></div>
+    <div class="quiz-row" id="ct-submit-row" hidden>
+      <button type="button" class="primary" id="ct-submit">交卷</button>
+      <button type="button" id="ct-skip-2">跳过这次</button>
+    </div>
+
+    <!-- ③ 判分结果 -->
+    <div class="quiz-result" id="ct-result" hidden></div>
+    <div class="quiz-row" id="ct-result-row" hidden>
+      <button type="button" id="ct-again">再出一份</button>
+      <button type="button" class="primary" id="ct-back">回到课程</button>
+    </div>
+  </main>
+</div>
+{% endblock %}

@@ -1,0 +1,2 @@
+[console_scripts]
+crewai = crewai_cli.cli:crewai

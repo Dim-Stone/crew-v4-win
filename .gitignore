@@ -1,0 +1,22 @@
+# 运行期数据：属于每个使用者自己，不进仓库
+instance/
+notes/*
+!notes/.gitkeep
+.env
+.env.local
+*.log
+.started-ok
+
+# Python 运行时产生的缓存
+#
+# 注意：只忽略 .pyc / .pyo，**不要**写成 *.py[cod]——
+# 那个字符类会连 .pyd 一起忽略，而 .pyd 是 Windows 上的二进制扩展模块
+# （_ssl、_sqlite3、lxml、cryptography 全靠它），漏掉它们程序直接起不来。
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store

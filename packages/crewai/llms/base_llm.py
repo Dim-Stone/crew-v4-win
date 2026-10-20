@@ -1,0 +1,1188 @@
+"""Base LLM abstract class for CrewAI.
+
+This module provides the abstract base class for all LLM implementations
+in CrewAI, including common functionality for native SDK implementations.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Generator
+from contextlib import contextmanager
+import contextvars
+from datetime import datetime
+from functools import wraps
+import json
+import logging
+import re
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
+import uuid
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_serializer,
+    model_validator,
+)
+from typing_extensions import TypedDict
+
+from crewai.events.event_bus import crewai_event_bus
+from crewai.events.types.llm_events import (
+    LLMCallCompletedEvent,
+    LLMCallFailedEvent,
+    LLMCallStartedEvent,
+    LLMCallType,
+    LLMStreamChunkEvent,
+    LLMThinkingChunkEvent,
+)
+from crewai.events.types.tool_usage_events import (
+    ToolUsageErrorEvent,
+    ToolUsageFinishedEvent,
+    ToolUsageStartedEvent,
+)
+from crewai.llms.retry import arun_with_rate_limit_retry, run_with_rate_limit_retry
+from crewai.types.streaming import StreamSession
+from crewai.types.usage_metrics import UsageMetrics
+from crewai.utilities.pydantic_schema_utils import serialize_model_class
+from crewai.utilities.streaming import (
+    create_frame_generator,
+    create_frame_streaming_state,
+)
+
+
+try:
+    from crewai_files import format_multimodal_content
+
+    HAS_CREWAI_FILES = True
+except ImportError:
+    HAS_CREWAI_FILES = False
+
+
+if TYPE_CHECKING:
+    from crewai.agents.agent_builder.base_agent import BaseAgent
+    from crewai.task import Task
+    from crewai.tools.base_tool import BaseTool
+    from crewai.utilities.types import LLMMessage
+
+
+class JsonResponseFormat(TypedDict):
+    """Response format requesting raw JSON output (e.g. ``{"type": "json_object"}``)."""
+
+    type: Literal["json_object"]
+
+
+class LLMCallBlockedError(ValueError):
+    """A ``before_llm_call`` hook blocked the call by returning ``False``.
+
+    A ``ValueError`` so the fail-open handlers around internal model calls keep
+    absorbing it, and its own type so a provider can report it as the decision
+    it is instead of letting it read as a provider outage.
+    """
+
+
+DEFAULT_CONTEXT_WINDOW_SIZE: Final[int] = 4096
+DEFAULT_SUPPORTS_STOP_WORDS: Final[bool] = True
+_JSON_EXTRACTION_PATTERN: Final[re.Pattern[str]] = re.compile(r"\{.*}", re.DOTALL)
+
+_current_call_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_call_id", default=None
+)
+_call_stop_override_var: contextvars.ContextVar[dict[int, list[str]] | None] = (
+    contextvars.ContextVar("_call_stop_override_var", default=None)
+)
+_call_stream_override_var: contextvars.ContextVar[dict[int, bool] | None] = (
+    contextvars.ContextVar("_call_stream_override_var", default=None)
+)
+
+
+@contextmanager
+def llm_call_context() -> Generator[str, None, None]:
+    """Context manager that establishes an LLM call scope with a unique call_id."""
+    call_id = str(uuid.uuid4())
+    token = _current_call_id.set(call_id)
+    try:
+        yield call_id
+    finally:
+        _current_call_id.reset(token)
+
+
+@contextmanager
+def call_stop_override(
+    llm: BaseLLM, stop: list[str] | None
+) -> Generator[None, None, None]:
+    """Override the stop list for ``llm`` within the current call scope.
+
+    Only ``llm``'s reads via :attr:`BaseLLM.stop_sequences` see ``stop``;
+    other LLM instances (e.g. an agent's ``function_calling_llm``) keep their
+    own ``stop`` field. Passing ``None`` clears any prior override for ``llm``
+    in the same scope. The instance-level ``stop`` field is never mutated,
+    so the override is safe under concurrent execution.
+    """
+    current = _call_stop_override_var.get()
+    new_overrides: dict[int, list[str]] = dict(current) if current else {}
+    if stop is None:
+        new_overrides.pop(id(llm), None)
+    else:
+        new_overrides[id(llm)] = stop
+    token = _call_stop_override_var.set(new_overrides)
+    try:
+        yield
+    finally:
+        _call_stop_override_var.reset(token)
+
+
+@contextmanager
+def call_stream_override(llm: BaseLLM, stream: bool) -> Generator[None, None, None]:
+    """Override streaming for ``llm`` within the current call scope."""
+    current = _call_stream_override_var.get()
+    new_overrides: dict[int, bool] = dict(current) if current else {}
+    new_overrides[id(llm)] = stream
+    token = _call_stream_override_var.set(new_overrides)
+    try:
+        yield
+    finally:
+        _call_stream_override_var.reset(token)
+
+
+def get_current_call_id() -> str:
+    """Get current call_id from context"""
+    call_id = _current_call_id.get()
+    if call_id is None:
+        logging.warning(
+            "LLM event emitted outside call context - generating fallback call_id"
+        )
+        return str(uuid.uuid4())
+    return call_id
+
+
+class BaseLLM(BaseModel, ABC):
+    """Abstract base class for LLM implementations.
+
+    This class defines the interface that all LLM implementations must follow.
+    Users can extend this class to create custom LLM implementations that don't
+    rely on litellm's authentication mechanism.
+
+    Custom LLM implementations should handle error cases gracefully, including
+    timeouts, authentication failures, and malformed responses. They should also
+    implement proper validation for input parameters and provide clear error
+    messages when things go wrong.
+
+    Attributes:
+        model: The model identifier/name.
+        temperature: Optional temperature setting for response generation.
+        stop: A list of stop sequences that the LLM should use to stop generation.
+        additional_params: Additional provider-specific parameters.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Wrap concrete client call methods with the shared retry policy."""
+        super().__init_subclass__(**kwargs)
+        cls._wrap_call_method("call")
+        cls._wrap_call_method("acall")
+
+    @classmethod
+    def _wrap_call_method(cls, method_name: str) -> None:
+        """Install one retry wrapper around a subclass-defined public call method."""
+        method = cls.__dict__.get(method_name)
+        if method is None or getattr(method, "_crewai_rate_limit_wrapped", False):
+            return
+
+        if method_name == "call":
+
+            @wraps(method)
+            def wrapped_call(instance: BaseLLM, *args: Any, **kwargs: Any) -> Any:
+                return run_with_rate_limit_retry(
+                    lambda: method(instance, *args, **kwargs)
+                )
+
+            wrapped_call._crewai_rate_limit_wrapped = True  # type: ignore[attr-defined]
+            setattr(cls, method_name, wrapped_call)
+            return
+
+        if method_name == "acall":
+
+            @wraps(method)
+            async def wrapped_acall(
+                instance: BaseLLM, *args: Any, **kwargs: Any
+            ) -> Any:
+                return await arun_with_rate_limit_retry(
+                    lambda: method(instance, *args, **kwargs)
+                )
+
+            wrapped_acall._crewai_rate_limit_wrapped = True  # type: ignore[attr-defined]
+            setattr(cls, method_name, wrapped_acall)
+            return
+
+        raise ValueError(f"Unsupported LLM call method: {method_name}")
+
+    llm_type: str = "base"
+    model: str
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | float | None = None
+    stream: bool | None = None
+    seed: int | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    n: int | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    provider: str = Field(default="openai")
+    prefer_upload: bool = False
+    is_litellm: bool = False
+    stop: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("stop", "stop_sequences"),
+    )
+    additional_params: dict[str, Any] = Field(default_factory=dict)
+
+    @field_serializer("response_format", when_used="json", check_fields=False)
+    def _serialize_response_format(self, value: Any) -> Any:
+        return serialize_model_class(value)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("stop", "stop_sequences"):
+            if value is None:
+                value = []
+            elif isinstance(value, str):
+                value = [value]
+            elif not isinstance(value, list):
+                value = list(value)
+            name = "stop"
+        try:
+            super().__setattr__(name, value)
+        except ValueError:
+            if name in self.model_fields:
+                raise  # Re-raise validation errors on declared fields
+            # Fallback for attributes not declared as fields (e.g. mock patching)
+            object.__setattr__(self, name, value)
+        except AttributeError:
+            object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        try:
+            super().__delattr__(name)
+        except AttributeError:
+            object.__delattr__(self, name)
+
+    @property
+    def stop_sequences(self) -> list[str]:
+        """Stop list active for the current call.
+
+        Returns the per-instance override set via :func:`call_stop_override`
+        when one is in effect for this LLM; otherwise the instance-level
+        ``stop`` field. Kept under this name for backward compatibility with
+        provider APIs that already read ``stop_sequences``.
+        """
+        overrides = _call_stop_override_var.get()
+        if overrides is not None:
+            override = overrides.get(id(self))
+            if override is not None:
+                return override
+        return self.stop
+
+    def _effective_stream(self) -> bool | None:
+        """Return the call-scoped streaming mode for this instance."""
+        overrides = _call_stream_override_var.get()
+        if overrides is not None and id(self) in overrides:
+            return overrides[id(self)]
+        return self.stream
+
+    _token_usage: dict[str, int] = PrivateAttr(
+        default_factory=lambda: {
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "successful_requests": 0,
+            "cached_prompt_tokens": 0,
+            "reasoning_tokens": 0,
+            "cache_creation_tokens": 0,
+        }
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_init_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        if not data.get("model"):
+            raise ValueError("Model name is required and cannot be empty")
+
+        stop_seqs = data.pop("stop_sequences", None)
+        stop = stop_seqs if stop_seqs is not None else data.get("stop")
+        if stop is None:
+            data["stop"] = []
+        elif isinstance(stop, str):
+            data["stop"] = [stop]
+        elif isinstance(stop, list):
+            data["stop"] = stop
+        else:
+            data["stop"] = list(stop)
+
+        if not data.get("provider"):
+            model = data.get("model") or ""
+            data["provider"] = (
+                cls._extract_provider(model) if isinstance(model, str) else "openai"
+            )
+
+        known_fields = set(cls.model_fields.keys())
+        extras = {k: v for k, v in data.items() if k not in known_fields}
+        for k in extras:
+            data.pop(k)
+        existing = data.get("additional_params") or {}
+        existing.update(extras)
+        data["additional_params"] = existing
+
+        return data
+
+    def to_config_dict(self) -> dict[str, Any]:
+        """Serialize this LLM to a dict that can reconstruct it via ``LLM(**config)``.
+
+        Returns the core fields that BaseLLM owns. Provider subclasses should
+        override this (calling ``super().to_config_dict()``) to add their own
+        fields (e.g. ``project``, ``location``, ``safety_settings``).
+        """
+        model = self.model
+        provider = self.provider
+        model_str = f"{provider}/{model}" if provider and "/" not in model else model
+
+        config: dict[str, Any] = {"model": model_str}
+
+        if self.temperature is not None:
+            config["temperature"] = self.temperature
+        if self.base_url is not None:
+            config["base_url"] = self.base_url
+        if self.stop:
+            config["stop"] = self.stop
+
+        return config
+
+    @abstractmethod
+    def call(
+        self,
+        messages: str | list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        callbacks: list[Any] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Call the LLM with the given messages.
+
+        Args:
+            messages: Input messages for the LLM.
+                     Can be a string or list of message dictionaries.
+                     If string, it will be converted to a single user message.
+                     If list, each dict must have 'role' and 'content' keys.
+            tools: Optional list of tool schemas for function calling.
+                  Each tool should define its name, description, and parameters.
+            callbacks: Optional list of callback functions to be executed
+                      during and after the LLM call.
+            available_functions: Optional dict mapping function names to callables
+                               that can be invoked by the LLM.
+            from_task: Optional task caller to be used for the LLM call.
+            from_agent: Optional agent caller to be used for the LLM call.
+            response_model: Optional response model to be used for the LLM call.
+
+        Returns:
+            Either a text response from the LLM (str) or
+            the result of a tool function call (Any).
+
+        Raises:
+            ValueError: If the messages format is invalid.
+            TimeoutError: If the LLM request times out.
+            RuntimeError: If the LLM request fails for other reasons.
+        """
+
+    def stream_events(
+        self,
+        messages: str | list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        callbacks: list[Any] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> StreamSession[Any]:
+        """Run the LLM call and stream scoped public ``StreamFrame`` events."""
+        result_holder: list[Any] = []
+        state = create_frame_streaming_state(result_holder, use_async=False)
+        output_holder: list[StreamSession[Any]] = []
+
+        def run_llm_call() -> Any:
+            with call_stream_override(self, True):
+                return self.call(
+                    messages=messages,
+                    tools=tools,
+                    callbacks=callbacks,
+                    available_functions=available_functions,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                    response_model=response_model,
+                )
+
+        stream_session: StreamSession[Any] = StreamSession(
+            sync_iterator=create_frame_generator(state, run_llm_call, output_holder)
+        )
+        output_holder.append(stream_session)
+        return stream_session
+
+    async def acall(
+        self,
+        messages: str | list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        callbacks: list[Any] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_model: type[BaseModel] | None = None,
+    ) -> str | Any:
+        """Call the LLM with the given messages.
+
+        Args:
+            messages: Input messages for the LLM.
+                     Can be a string or list of message dictionaries.
+                     If string, it will be converted to a single user message.
+                     If list, each dict must have 'role' and 'content' keys.
+            tools: Optional list of tool schemas for function calling.
+                  Each tool should define its name, description, and parameters.
+            callbacks: Optional list of callback functions to be executed
+                      during and after the LLM call.
+            available_functions: Optional dict mapping function names to callables
+                               that can be invoked by the LLM.
+            from_task: Optional task caller to be used for the LLM call.
+            from_agent: Optional agent caller to be used for the LLM call.
+            response_model: Optional response model to be used for the LLM call.
+
+        Returns:
+            Either a text response from the LLM (str) or
+            the result of a tool function call (Any).
+
+        Raises:
+            ValueError: If the messages format is invalid.
+            TimeoutError: If the LLM request times out.
+            RuntimeError: If the LLM request fails for other reasons.
+        """
+        raise NotImplementedError
+
+    def _convert_tools_for_interference(
+        self, tools: list[dict[str, BaseTool]]
+    ) -> list[dict[str, BaseTool]]:
+        """Convert tools to a format that can be used for interference.
+
+        Args:
+            tools: List of tools to convert.
+
+        Returns:
+            List of converted tools (default implementation returns as-is)
+        """
+        return tools
+
+    def supports_stop_words(self) -> bool:
+        """Check if the LLM supports stop words.
+
+        Returns:
+            True if the LLM supports stop words, False otherwise.
+        """
+        return DEFAULT_SUPPORTS_STOP_WORDS
+
+    def _supports_stop_words_implementation(self) -> bool:
+        """Check if stop words are configured for this LLM instance.
+
+        Native providers can override supports_stop_words() to return this value
+        to ensure consistent behavior based on whether stop words are actually configured.
+
+        Returns:
+            True if stop words are configured and can be applied
+        """
+        return bool(self.stop_sequences)
+
+    def _apply_stop_words(self, content: str) -> str:
+        """Apply stop words to truncate response content.
+
+        This method provides consistent stop word behavior across all native SDK providers.
+        Native providers should call this method to post-process their responses.
+
+        Args:
+            content: The raw response content from the LLM
+
+        Returns:
+            Content truncated at the first occurrence of any stop word
+
+        Example:
+            >>> llm = MyNativeLLM(stop=["Observation:", "Final Answer:"])
+            >>> response = (
+            ...     "I need to search.\\n\\nAction: search\\nObservation: Found results"
+            ... )
+            >>> llm._apply_stop_words(response)
+            "I need to search.\\n\\nAction: search"
+        """
+        stops = self.stop_sequences
+        if not stops or not content:
+            return content
+
+        earliest_stop_pos = len(content)
+        found_stop_word = None
+
+        for stop_word in stops:
+            stop_pos = content.find(stop_word)
+            if stop_pos != -1 and stop_pos < earliest_stop_pos:
+                earliest_stop_pos = stop_pos
+                found_stop_word = stop_word
+
+        if found_stop_word is not None:
+            truncated = content[:earliest_stop_pos].strip()
+            logging.debug(
+                f"Applied stop word '{found_stop_word}' at position {earliest_stop_pos}"
+            )
+            return truncated
+
+        return content
+
+    def get_context_window_size(self) -> int:
+        """Get the context window size for the LLM.
+
+        Returns:
+            The number of tokens/characters the model can handle.
+        """
+        return DEFAULT_CONTEXT_WINDOW_SIZE
+
+    def supports_multimodal(self) -> bool:
+        """Check if the LLM supports multimodal inputs.
+
+        Returns:
+            True if the LLM supports images, PDFs, audio, or video.
+        """
+        return False
+
+    def _multimodal_formatter_name(self) -> str:
+        # Content-block schema key for crewai_files. Identity stays on self.provider.
+        return self.provider or self.model
+
+    def format_text_content(self, text: str) -> dict[str, Any]:
+        """Format text as a content block for the LLM.
+
+        Default implementation uses OpenAI/Anthropic format.
+        Subclasses should override for provider-specific formatting.
+
+        Args:
+            text: The text content to format.
+
+        Returns:
+            A content block in the provider's expected format.
+        """
+        return {"type": "text", "text": text}
+
+    def get_file_uploader(self) -> Any:
+        """Get a file uploader configured with this LLM's client.
+
+        Returns an uploader instance that reuses this LLM's authenticated client,
+        avoiding the need to create a new connection for file uploads.
+
+        Returns:
+            A FileUploader instance, or None if not supported by this provider.
+        """
+        return None
+
+    def _effective_max_tokens(self) -> int | float | None:
+        """Token cap actually sent to the provider, for start-event telemetry.
+
+        Defaults to ``self.max_tokens``. Providers that cap generation through a
+        differently named field (e.g. ``max_completion_tokens`` on OpenAI/Azure,
+        ``max_output_tokens`` on Gemini) override this so ``LLMCallStartedEvent``
+        reports the real limit instead of ``None``.
+        """
+        return self.max_tokens
+
+    def _emit_call_started_event(
+        self,
+        messages: str | list[LLMMessage],
+        tools: list[dict[str, BaseTool]] | None = None,
+        callbacks: list[Any] | None = None,
+        available_functions: dict[str, Any] | None = None,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | float | None = None,
+        stream: bool | None = None,
+        seed: int | None = None,
+        stop_sequences: list[str] | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        n: int | None = None,
+    ) -> None:
+        """Emit LLM call started event."""
+        from crewai.utilities.serialization import to_serializable
+
+        if temperature is None:
+            temperature = self.temperature
+        if top_p is None:
+            top_p = self.top_p
+        if max_tokens is None:
+            max_tokens = self._effective_max_tokens()
+        if stream is None:
+            stream = self._effective_stream()
+        if seed is None:
+            seed = self.seed
+        if stop_sequences is None:
+            stop_sequences = self.stop_sequences or None
+        if frequency_penalty is None:
+            frequency_penalty = self.frequency_penalty
+        if presence_penalty is None:
+            presence_penalty = self.presence_penalty
+        if n is None:
+            n = self.n
+
+        crewai_event_bus.emit(
+            self,
+            event=LLMCallStartedEvent(
+                messages=to_serializable(messages),
+                tools=to_serializable(tools),
+                callbacks=callbacks,
+                available_functions=available_functions,
+                from_task=from_task,
+                from_agent=from_agent,
+                model=self.model,
+                call_id=get_current_call_id(),
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                stream=stream,
+                seed=seed,
+                stop_sequences=stop_sequences,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                n=n,
+            ),
+        )
+
+    def _emit_call_completed_event(
+        self,
+        response: Any,
+        call_type: LLMCallType,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        messages: str | list[LLMMessage] | None = None,
+        usage: dict[str, Any] | None = None,
+        finish_reason: str | None = None,
+        response_id: str | None = None,
+    ) -> None:
+        """Emit LLM call completed event."""
+        from crewai.utilities.serialization import to_serializable
+
+        crewai_event_bus.emit(
+            self,
+            event=LLMCallCompletedEvent(
+                messages=to_serializable(messages),
+                response=to_serializable(response),
+                call_type=call_type,
+                from_task=from_task,
+                from_agent=from_agent,
+                model=self.model,
+                call_id=get_current_call_id(),
+                usage=usage,
+                finish_reason=finish_reason,
+                response_id=response_id,
+            ),
+        )
+
+    def _emit_call_failed_event(
+        self,
+        error: str,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+    ) -> None:
+        """Emit LLM call failed event."""
+        crewai_event_bus.emit(
+            self,
+            event=LLMCallFailedEvent(
+                error=error,
+                from_task=from_task,
+                from_agent=from_agent,
+                model=self.model,
+                call_id=get_current_call_id(),
+            ),
+        )
+
+    def _emit_call_denied_event(
+        self,
+        denial: Exception,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+    ) -> None:
+        """Report a hook deny as a deny rather than as a provider failure.
+
+        The call still owes its started event a terminal one, so the failed event
+        is emitted — with a message that names the decision instead of blaming
+        the provider for an outage that never happened.
+        """
+        from crewai.hooks.dispatch import source_name
+
+        source = source_name(getattr(denial, "source", None))
+        reason = getattr(denial, "reason", str(denial))
+        message = f"LLM call denied by {source or 'hook'}: {reason}"
+        logging.warning(message)
+        self._emit_call_failed_event(
+            error=message, from_task=from_task, from_agent=from_agent
+        )
+
+    def _emit_stream_chunk_event(
+        self,
+        chunk: str,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        tool_call: dict[str, Any] | None = None,
+        call_type: LLMCallType | None = None,
+        response_id: str | None = None,
+    ) -> None:
+        """Emit stream chunk event.
+
+        Args:
+            chunk: The text content of the chunk.
+            from_task: The task that initiated the call.
+            from_agent: The agent that initiated the call.
+            tool_call: Tool call information if this is a tool call chunk.
+            call_type: The type of LLM call (LLM_CALL or TOOL_CALL).
+            response_id: Unique ID for a particular LLM response, chunks have same response_id.
+        """
+        crewai_event_bus.emit(
+            self,
+            event=LLMStreamChunkEvent(
+                chunk=chunk,
+                tool_call=tool_call,
+                from_task=from_task,
+                from_agent=from_agent,
+                call_type=call_type,
+                response_id=response_id,
+                call_id=get_current_call_id(),
+            ),
+        )
+
+    def _emit_thinking_chunk_event(
+        self,
+        chunk: str,
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+        response_id: str | None = None,
+    ) -> None:
+        """Emit thinking/reasoning chunk event from a thinking model.
+
+        Args:
+            chunk: The thinking text content.
+            from_task: The task that initiated the call.
+            from_agent: The agent that initiated the call.
+            response_id: Unique ID for a particular LLM response.
+        """
+        crewai_event_bus.emit(
+            self,
+            event=LLMThinkingChunkEvent(
+                chunk=chunk,
+                from_task=from_task,
+                from_agent=from_agent,
+                response_id=response_id,
+                call_id=get_current_call_id(),
+            ),
+        )
+
+    def _handle_tool_execution(
+        self,
+        function_name: str,
+        function_args: dict[str, Any],
+        available_functions: dict[str, Any],
+        from_task: Task | None = None,
+        from_agent: BaseAgent | None = None,
+    ) -> str | None:
+        """Handle tool execution with proper event emission.
+
+        Args:
+            function_name: Name of the function to execute
+            function_args: Arguments to pass to the function
+            available_functions: Dict of available functions
+            from_task: Optional task object
+            from_agent: Optional agent object
+
+        Returns:
+            Result of function execution or None if function not found
+        """
+        if function_name not in available_functions:
+            logging.warning(
+                f"Function '{function_name}' not found in available functions"
+            )
+            return None
+
+        try:
+            started_at = datetime.now()
+
+            crewai_event_bus.emit(
+                self,
+                event=ToolUsageStartedEvent(
+                    tool_name=function_name,
+                    tool_args=function_args,
+                    from_agent=from_agent,
+                    from_task=from_task,
+                ),
+            )
+
+            fn = available_functions[function_name]
+            result = fn(**function_args)
+
+            crewai_event_bus.emit(
+                self,
+                event=ToolUsageFinishedEvent(
+                    output=result,
+                    tool_name=function_name,
+                    tool_args=function_args,
+                    started_at=started_at,
+                    finished_at=datetime.now(),
+                    from_task=from_task,
+                    from_agent=from_agent,
+                ),
+            )
+
+            self._emit_call_completed_event(
+                response=result,
+                call_type=LLMCallType.TOOL_CALL,
+                from_task=from_task,
+                from_agent=from_agent,
+            )
+
+            return str(result) if not isinstance(result, str) else result
+
+        except Exception as e:
+            error_msg = f"Error executing function '{function_name}': {e!s}"
+            logging.error(error_msg)
+
+            if not hasattr(crewai_event_bus, "emit"):
+                raise ValueError(
+                    "crewai_event_bus does not have an emit method"
+                ) from None
+
+            crewai_event_bus.emit(
+                self,
+                event=ToolUsageErrorEvent(
+                    tool_name=function_name,
+                    tool_args=function_args,
+                    error=error_msg,
+                    from_task=from_task,
+                    from_agent=from_agent,
+                ),
+            )
+
+            self._emit_call_failed_event(
+                error=error_msg,
+                from_task=from_task,
+                from_agent=from_agent,
+            )
+
+            return None
+
+    def _format_messages(self, messages: str | list[LLMMessage]) -> list[LLMMessage]:
+        """Convert messages to standard format.
+
+        Args:
+            messages: Input messages (string or list of message dicts)
+
+        Returns:
+            List of message dictionaries with 'role' and 'content' keys
+
+        Raises:
+            ValueError: If message format is invalid
+        """
+        from crewai.llms.cache import CACHE_BREAKPOINT_KEY
+        from crewai.utilities.types import LLMMessage as _LLMMessage
+
+        if isinstance(messages, str):
+            return [{"role": "user", "content": messages}]
+
+        # Validate then copy each message, dropping the cache-breakpoint
+        # flag in the copy only. The caller (e.g. CrewAgentExecutor,
+        # experimental.AgentExecutor) reuses its messages buffer across
+        # many LLM calls in the tool-use loop; mutating their dicts
+        # in place would erase the markers after the first call and
+        # break prompt caching for every subsequent iteration.
+        cleaned: list[LLMMessage] = []
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                raise ValueError(f"Message at index {i} must be a dictionary")
+            if "role" not in msg or "content" not in msg:
+                raise ValueError(
+                    f"Message at index {i} must have 'role' and 'content' keys"
+                )
+            copy: dict[str, Any] = {
+                k: v for k, v in msg.items() if k != CACHE_BREAKPOINT_KEY
+            }
+            cleaned.append(cast(_LLMMessage, copy))
+
+        return self._process_message_files(cleaned)
+
+    def _process_message_files(self, messages: list[LLMMessage]) -> list[LLMMessage]:
+        """Process files attached to messages and format for the provider.
+
+        For each message with a `files` field, formats the files into
+        provider-specific content blocks and updates the message content.
+
+        Args:
+            messages: List of messages that may contain file attachments.
+
+        Returns:
+            Messages with files formatted into content blocks.
+        """
+        if not HAS_CREWAI_FILES:
+            return messages
+
+        if not self.supports_multimodal():
+            if any(msg.get("files") for msg in messages):
+                raise ValueError(
+                    f"Model '{self.model}' does not support multimodal input, "
+                    "but files were provided via 'input_files'. "
+                    "Use a vision-capable model or remove the file inputs."
+                )
+            return messages
+
+        formatter = self._multimodal_formatter_name()
+        api = getattr(self, "api", None)
+
+        for msg in messages:
+            files = msg.get("files")
+            if not files:
+                continue
+
+            existing_content = msg.get("content", "")
+            text = existing_content if isinstance(existing_content, str) else None
+
+            content_blocks = format_multimodal_content(
+                files, formatter, api=api, prefer_upload=self.prefer_upload, text=text
+            )
+            if not content_blocks:
+                msg.pop("files", None)
+                continue
+
+            if isinstance(existing_content, list):
+                msg["content"] = [*existing_content, *content_blocks]
+            else:
+                msg["content"] = content_blocks
+
+            msg.pop("files", None)
+
+        return messages
+
+    @staticmethod
+    def _validate_structured_output(
+        response: str,
+        response_format: type[BaseModel] | None,
+    ) -> str | BaseModel:
+        """Validate and parse structured output.
+
+        Args:
+            response: Raw response string
+            response_format: Optional Pydantic model for structured output
+
+        Returns:
+            Parsed response (BaseModel instance if response_format provided, otherwise string)
+
+        Raises:
+            ValueError: If structured output validation fails
+        """
+        if response_format is None:
+            return response
+
+        try:
+            if response.strip().startswith("{") or response.strip().startswith("["):
+                data = json.loads(response)
+                return response_format.model_validate(data)
+
+            json_match = _JSON_EXTRACTION_PATTERN.search(response)
+            if json_match:
+                data = json.loads(json_match.group())
+                return response_format.model_validate(data)
+
+            raise ValueError("No JSON found in response")
+
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.warning(f"Failed to parse structured output: {e}")
+            raise ValueError(
+                f"Failed to parse response into {response_format.__name__}: {e}"
+            ) from e
+
+    @staticmethod
+    def _extract_provider(model: str) -> str:
+        """Extract provider from model string.
+
+        Args:
+            model: Model string (e.g., 'openai/gpt-4' or 'gpt-4')
+
+        Returns:
+            Provider name (e.g., 'openai')
+        """
+        if "/" in model:
+            return model.partition("/")[0]
+        return "openai"  # Default provider
+
+    def _track_token_usage_internal(self, usage_data: dict[str, Any]) -> None:
+        """Track token usage internally in the LLM instance.
+
+        Args:
+            usage_data: Token usage data from the API response
+        """
+        metrics = UsageMetrics.from_provider_dict(usage_data)
+        if metrics is None:
+            return
+
+        self._token_usage["prompt_tokens"] += metrics.prompt_tokens
+        self._token_usage["completion_tokens"] += metrics.completion_tokens
+        self._token_usage["total_tokens"] += metrics.total_tokens
+        self._token_usage["successful_requests"] += metrics.successful_requests
+        self._token_usage["cached_prompt_tokens"] += metrics.cached_prompt_tokens
+        self._token_usage["reasoning_tokens"] += metrics.reasoning_tokens
+        self._token_usage["cache_creation_tokens"] += metrics.cache_creation_tokens
+
+    def get_token_usage_summary(self) -> UsageMetrics:
+        """Get summary of token usage for this LLM instance.
+
+        The counters are cumulative for the lifetime of this instance: they
+        grow across every call made through it, including calls issued by
+        different agents sharing the instance. For usage scoped to a single
+        call, snapshot before and after and use
+        ``UsageMetrics.delta_since`` (agent kickoff results already report
+        per-call usage this way).
+
+        Returns:
+            UsageMetrics with this instance's lifetime token usage totals.
+        """
+        return UsageMetrics(**self._token_usage)
+
+    def _invoke_before_llm_call_hooks(
+        self,
+        messages: list[LLMMessage],
+        from_agent: BaseAgent | None = None,
+    ) -> bool:
+        """Invoke before_llm_call hooks for an LLM call reaching the provider.
+
+        This method should be called by native provider implementations before
+        making the actual LLM call. It no-ops when an enclosing caller — the
+        executor — already dispatched the hooks for this same call.
+
+        Args:
+            messages: The messages being sent to the LLM
+            from_agent: The agent making the call, when there is one
+
+        Returns:
+            True, so a provider may still guard the call with ``if not ...``.
+            A block is raised, never returned.
+
+        Raises:
+            HookAborted: If a hook raised it. The deny reaches the caller intact
+                instead of being flattened into a provider-style error.
+            LLMCallBlockedError: If a legacy hook blocked the call by returning
+                ``False``. A ``ValueError``, so the fail-open handlers around
+                internal model calls keep absorbing it.
+
+        Example:
+            >>> # In a native provider's call() method:
+            >>> self._invoke_before_llm_call_hooks(messages, from_agent)
+        """
+        from crewai_core.printer import PRINTER
+
+        from crewai.hooks.dispatch import InterceptionPoint, dispatch
+        from crewai.hooks.llm_hooks import (
+            LLMCallHookContext,
+            LegacyHookBlocked,
+            before_llm_call_reducer,
+            model_call_hooks_already_dispatched,
+        )
+
+        if model_call_hooks_already_dispatched():
+            return True
+
+        # No early global-list guard: dispatch resolves global + execution-scoped
+        # hooks and has its own no-op fast path, so scoped hooks still run here.
+        hook_context = LLMCallHookContext(
+            executor=None,
+            messages=messages,
+            llm=self,
+            agent=from_agent,
+            task=None,
+            crew=None,
+        )
+
+        try:
+            dispatch(
+                InterceptionPoint.PRE_MODEL_CALL,
+                hook_context,
+                reducer=before_llm_call_reducer,
+            )
+        except LegacyHookBlocked as blocked:
+            PRINTER.print(
+                content="LLM call blocked by before_llm_call hook",
+                color="yellow",
+            )
+            raise LLMCallBlockedError(
+                "LLM call blocked by before_llm_call hook"
+            ) from blocked
+
+        return True
+
+    def _invoke_after_llm_call_hooks(
+        self,
+        messages: list[LLMMessage],
+        response: str,
+        from_agent: BaseAgent | None = None,
+    ) -> str:
+        """Invoke after_llm_call hooks for an LLM call that reached the provider.
+
+        This method should be called by native provider implementations after
+        receiving the LLM response. It no-ops when an enclosing caller — the
+        executor — already dispatched the hooks for this same call.
+
+        Args:
+            messages: The messages that were sent to the LLM
+            response: The response from the LLM
+            from_agent: The agent that made the call, when there is one
+
+        Returns:
+            The potentially modified response string
+
+        Example:
+            >>> # In a native provider's call() method:
+            >>> if isinstance(result, str):
+            ...     result = self._invoke_after_llm_call_hooks(
+            ...         messages, result, from_agent
+            ...     )
+        """
+        from crewai.hooks.dispatch import InterceptionPoint, dispatch
+        from crewai.hooks.llm_hooks import (
+            LLMCallHookContext,
+            after_llm_call_reducer,
+            model_call_hooks_already_dispatched,
+        )
+
+        if model_call_hooks_already_dispatched() or not isinstance(response, str):
+            return response
+
+        # No early global-list guard: dispatch resolves global + execution-scoped
+        # hooks and has its own no-op fast path, so scoped hooks still run here.
+        hook_context = LLMCallHookContext(
+            executor=None,
+            messages=messages,
+            llm=self,
+            agent=from_agent,
+            task=None,
+            crew=None,
+            response=response,
+        )
+
+        dispatch(
+            InterceptionPoint.POST_MODEL_CALL,
+            hook_context,
+            reducer=after_llm_call_reducer,
+        )
+
+        return hook_context.response if hook_context.response is not None else response

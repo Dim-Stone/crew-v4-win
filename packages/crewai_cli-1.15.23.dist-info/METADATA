@@ -1,0 +1,53 @@
+Metadata-Version: 2.5
+Name: crewai-cli
+Version: 1.15.23
+Summary: CLI for CrewAI — scaffold, run, deploy and manage AI agent crews.
+Project-URL: Homepage, https://crewai.com
+Project-URL: Documentation, https://docs.crewai.com
+Project-URL: Repository, https://github.com/crewAIInc/crewAI
+Author-email: Joao Moura <joao@crewai.com>
+Requires-Python: <3.14,>=3.10
+Requires-Dist: appdirs~=1.4.4
+Requires-Dist: certifi
+Requires-Dist: click<9,>=8.1.7
+Requires-Dist: crewai-core==1.15.23
+Requires-Dist: cryptography>=42.0
+Requires-Dist: httpx~=0.28.1
+Requires-Dist: packaging>=23.0
+Requires-Dist: pydantic-settings<3,>=2.14.2
+Requires-Dist: pydantic<2.13,>=2.11.9
+Requires-Dist: pyjwt<3,>=2.13.0
+Requires-Dist: python-dotenv<2,>=1.2.2
+Requires-Dist: rich>=13.7.1
+Requires-Dist: textual>=7.5.0
+Requires-Dist: tomli-w~=1.1.0
+Requires-Dist: tomli~=2.0.2
+Requires-Dist: uv~=0.11.6
+Description-Content-Type: text/markdown
+
+# crewai-cli
+
+CLI for CrewAI — scaffold, run, deploy and manage AI agent crews without
+installing the full framework.
+
+## Installation
+
+```bash
+pip install crewai-cli
+```
+
+This pulls in `crewai-core` (shared utilities) but not the `crewai` framework
+itself, so commands that don't need a crew loaded — `crewai version`,
+`crewai login`, `crewai org list`, `crewai config *`, `crewai traces *`,
+`crewai create`, `crewai template *` — work standalone.
+
+Commands that load a user's crew or flow (`crewai run`, `crewai train`,
+`crewai test`, `crewai chat`, `crewai replay`, `crewai reset-memories`,
+`crewai deploy push`, `crewai tool publish`) require `crewai` to be installed
+in the project's environment. They print a clear error if it is missing.
+
+To install both at once:
+
+```bash
+pip install crewai[cli]
+```

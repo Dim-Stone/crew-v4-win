@@ -1,0 +1,11 @@
+python313.zip
+.
+
+# Uncomment to run site.main() automatically
+#import site
+..\packages
+..
+..\packages\win32
+..\packages\win32\lib
+..\packages\pythonwin
+import site

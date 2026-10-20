@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}我的课程 · CREW{% endblock %}
+
+{% block body %}
+<main class="page">
+
+  <!-- 第一次打开时出现：告诉他"还差一步就能用"，并且一键到设置页。
+       能关掉（记在本地），否则每次回首页都挡在前面。 -->
+  <section class="first-run-banner" id="first-run-banner" hidden>
+    <div class="first-run-banner-text">
+      <strong>还差一步：填一个 API 密钥</strong>
+      <span>没有密钥也能看课程和讲义，但新建课程、生成大纲、讲课都用不了。</span>
+    </div>
+    <a class="primary" href="/settings">去设置</a>
+    <button type="button" class="ghost" id="first-run-dismiss" aria-label="不再提示">
+      知道了
+    </button>
+  </section>
+
+  <!-- 今天：日期选择 + 那一天的待办。
+       顺序是有意的——"我今天要做什么"比"我有哪些课"更常被先问起，
+       所以日期与待办在上、课程在下面。 -->
+  <section class="today">
+    <div class="today-date">
+      <!-- 年月日各自可调：每个单位上面一个"往后"、下面一个"往前"。
+           为什么把日拆成三个而不是一个整体的日期框：用户要改的往往只是"明天"
+           或者"上个月"，拆开之后一次点击就到，不用先选中再打字。
+           数字由 JS 填（见 dashboard.js），结构在这里是静态的——
+           少了挂载点的话 JS 会静默什么都不做。 -->
+      <div class="date-picker" id="date-picker" aria-label="选择日期">
+        <div class="date-field">
+          <button class="date-step" type="button" data-unit="year" data-step="1"
+                  aria-label="后一年">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M6 15l6-6 6 6"/>
+            </svg>
+          </button>
+          <span class="date-value" id="date-year">—</span>
+          <span class="date-unit">年</span>
+          <button class="date-step" type="button" data-unit="year" data-step="-1"
+                  aria-label="前一年">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M6 9l6 6 6-6"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="date-field">
+          <button class="date-step" type="button" data-unit="month" data-step="1"
+                  aria-label="后一月">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M6 15l6-6 6 6"/>
+            </svg>
+          </button>
+          <span class="date-value" id="date-month">—</span>
+          <span class="date-unit">月</span>
+          <button class="date-step" type="button" data-unit="month" data-step="-1"
+                  aria-label="前一月">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M6 9l6 6 6-6"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="date-field">
+          <button class="date-step" type="button" data-unit="day" data-step="1"
+                  aria-label="后一天">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M6 15l6-6 6 6"/>
+            </svg>
+          </button>
+          <span class="date-value" id="date-day">—</span>
+          <span class="date-unit">日</span>
+          <button class="date-step" type="button" data-unit="day" data-step="-1"
+                  aria-label="前一天">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M6 9l6 6 6-6"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="date-meta">
+        <span class="today-week" id="today-week"></span>
+        <button class="ghost" type="button" id="date-today">回到今天</button>
+      </div>
+    </div>
+
+    <div class="todo">
+      <div class="todo-head">
+        <h2>待办</h2>
+        <span class="faint" id="todo-count"></span>
+      </div>
+      <!-- 列表限高、自己滚：待办多起来时不该把下面的课程挤下去 -->
+      <ul class="todo-list" id="todo-list"></ul>
+      <form class="todo-form" id="todo-form">
+        <input id="todo-input" type="text" maxlength="300" autocomplete="off"
+               placeholder="写一条待办，回车保存">
+        <button class="primary" type="submit">添加</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- 记事：选中日期的自由记录，与上面的待办同属"这一天"。
+       它**只按日期取**，与课程无关；换日期时两边一起换。 -->
+  <section class="day-note">
+    <div class="day-note-head">
+      <h2>记事</h2>
+      <span class="faint" id="note-status"></span>
+    </div>
+    <textarea id="note-text" rows="6" spellcheck="false"
+              placeholder="这一天想记什么就写什么——写完自动保存"></textarea>
+  </section>
+
+  <!-- 我的课程：标题左侧，新建入口在标题右边 -->
+  <div class="section-head courses-head">
+    <div>
+      <h1>我的课程</h1>
+      <p class="faint" id="summary">加载中…</p>
+      <!-- 所有课程合起来的进度：把摘要里那两个数字变成一眼能看出的比例。
+           单门课的进度在各自的卡片上，这里不重复。 -->
+      <div class="progress-line overall hidden" id="overall"><i></i></div>
+    </div>
+    <button id="new-course" class="primary">新建课程</button>
+  </div>
+
+  <div id="courses"></div>
+</main>
+{% endblock %}
